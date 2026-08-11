@@ -1,0 +1,13 @@
+[package]
+description = "Application layer for sui — terminal run-loop, event handling, and prompt state management."
+edition.workspace = true
+name = "sui-app"
+version.workspace = true
+
+[dependencies]
+crossterm = { workspace = true }
+ratatui = { workspace = true, features = ["crossterm"] }
+sui-widget = { workspace = true }
+
+[lints]
+workspace = true
