@@ -679,18 +679,18 @@ mod tests {
     #[tokio::test]
     #[cfg(unix)]
     async fn drop_kills_process_group_orphans() -> Result<(), ToolsError> {
-        // Unique sleep duration used as a process marker for pgrep.
-        let marker_secs = 987_651_234_u64;
+        // Capture the background PID explicitly — nix sandboxes often lack `pgrep`.
         let mut session = BashSession::spawn(None)?;
         session
-            .write_line(&format!("sleep {marker_secs} & echo STARTED; exit"))
+            .write_line("sleep 999999 & echo PID:$!; exit")
             .await?;
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let mut stdout = String::new();
         loop {
             let out = session.drain().await?;
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            if stdout.contains("STARTED") || !matches!(out.state, ProcessState::Running) {
+            stdout.push_str(&String::from_utf8_lossy(&out.stdout));
+            if stdout.contains("PID:") || !matches!(out.state, ProcessState::Running) {
                 break;
             }
             if tokio::time::Instant::now() > deadline {
@@ -699,19 +699,24 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
 
+        let pid = stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("PID:"))
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| ToolsError::Bash(format!("missing PID in stdout: {stdout:?}")))?
+            .to_owned();
+
         // Do not call wait() (it also cleans the group); Drop must do the work.
         drop(session);
         tokio::time::sleep(Duration::from_millis(300)).await;
 
-        let output = std::process::Command::new("pgrep")
-            .args(["-f", &format!("sleep {marker_secs}")])
-            .output()
-            .map_err(|e| ToolsError::Bash(format!("pgrep failed: {e}")))?;
-        assert!(
-            output.stdout.is_empty(),
-            "orphan sleep still alive: {}",
-            String::from_utf8_lossy(&output.stdout)
-        );
+        let alive = std::process::Command::new("/bin/kill")
+            .args(["-0", &pid])
+            .status()
+            .map_err(|e| ToolsError::Bash(format!("/bin/kill -0 failed: {e}")))?
+            .success();
+        assert!(!alive, "orphan sleep pid {pid} still alive after Drop");
         Ok(())
     }
 
