@@ -30,6 +30,7 @@ impl App {
         self.slash_selected = 0;
     }
 
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn handle_key(
         &mut self,
         key: KeyEvent,
@@ -70,6 +71,60 @@ impl App {
             },
             KeyCode::Home => self.cursor_position = 0,
             KeyCode::End => self.cursor_position = self.input.chars().count(),
+            KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.cursor_position = 0;
+            },
+            KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.cursor_position = self.input.chars().count();
+            },
+            KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if self.cursor_position < self.input.chars().count() {
+                    self.cursor_position = self.cursor_position.saturating_add(1);
+                }
+            },
+            KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if self.cursor_position > 0 {
+                    self.cursor_position = self.cursor_position.saturating_sub(1);
+                }
+            },
+            KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if self.cursor_position > 0 {
+                    let new_pos = self.cursor_position.saturating_sub(1);
+                    if let Some(byte_idx) = char_index_to_byte(&self.input, new_pos) {
+                        self.input.remove(byte_idx);
+                        self.cursor_position = new_pos;
+                    }
+                }
+                self.update_slash_candidates();
+            },
+            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if self.cursor_position < self.input.chars().count()
+                    && let Some(byte_idx) = char_index_to_byte(&self.input, self.cursor_position)
+                {
+                    self.input.remove(byte_idx);
+                }
+                self.update_slash_candidates();
+            },
+            KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if self.cursor_position < self.input.chars().count() {
+                    let start_byte = char_index_to_byte(&self.input, self.cursor_position)
+                        .unwrap_or(self.input.len());
+                    self.input.truncate(start_byte);
+                }
+                self.update_slash_candidates();
+            },
+            KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if !self.slash_candidates.is_empty() {
+                    let len = self.slash_candidates.len();
+                    self.slash_selected = (self.slash_selected + 1) % len;
+                }
+            },
+            KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if !self.slash_candidates.is_empty() {
+                    let len = self.slash_candidates.len();
+                    self.slash_selected = (self.slash_selected + len - 1) % len;
+                }
+            },
             KeyCode::Char(c) => {
                 let byte_pos = char_index_to_byte(&self.input, self.cursor_position)
                     .unwrap_or(self.input.len());

@@ -37,6 +37,10 @@ fn key(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)
 }
 
+fn ctrl_key(c: char) -> KeyEvent {
+    KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+}
+
 #[test]
 fn typing_appends_to_input() {
     let mut app = App::new();
@@ -301,6 +305,180 @@ fn slash_selected_resets_when_candidates_shrink() {
     let mut app = App::new();
     // Populate candidates with "/"
     app.handle_key(key_char('/'));
+    assert_eq!(app.slash_selected, 0);
+}
+
+// ── Emacs-style key tests ────────────────────────────────────────
+
+#[test]
+fn ctrl_f_moves_cursor_right() {
+    let mut app = App::new();
+    app.handle_key(key_char('a'));
+    app.handle_key(ctrl_key('b'));
+    assert_eq!(app.cursor_position, 0);
+    app.handle_key(ctrl_key('f'));
+    assert_eq!(app.cursor_position, 1);
+}
+
+#[test]
+fn ctrl_b_moves_cursor_left() {
+    let mut app = App::new();
+    app.handle_key(key_char('a'));
+    app.handle_key(key_char('b'));
+    assert_eq!(app.cursor_position, 2);
+    app.handle_key(ctrl_key('b'));
+    assert_eq!(app.cursor_position, 1);
+}
+
+#[test]
+fn ctrl_a_moves_to_start() {
+    let mut app = App::new();
+    app.handle_key(key_char('h'));
+    app.handle_key(key_char('i'));
+    app.handle_key(ctrl_key('a'));
+    assert_eq!(app.cursor_position, 0);
+}
+
+#[test]
+fn ctrl_e_moves_to_end() {
+    let mut app = App::new();
+    app.handle_key(key_char('h'));
+    app.handle_key(key_char('i'));
+    app.handle_key(ctrl_key('a'));
+    assert_eq!(app.cursor_position, 0);
+    app.handle_key(ctrl_key('e'));
+    assert_eq!(app.cursor_position, 2);
+}
+
+#[test]
+fn ctrl_h_deletes_before_cursor() {
+    let mut app = App::new();
+    app.handle_key(key_char('a'));
+    app.handle_key(key_char('b'));
+    app.handle_key(ctrl_key('h'));
+    assert_eq!(app.input, "a");
+    assert_eq!(app.cursor_position, 1);
+}
+
+#[test]
+fn ctrl_h_at_start_does_nothing() {
+    let mut app = App::new();
+    app.handle_key(key_char('x'));
+    app.handle_key(key(KeyCode::Home));
+    app.handle_key(ctrl_key('h'));
+    assert_eq!(app.input, "x");
+    assert_eq!(app.cursor_position, 0);
+}
+
+#[test]
+fn ctrl_h_updates_slash_candidates() {
+    let mut app = App::new();
+    app.handle_key(key_char('/'));
+    assert!(!app.slash_candidates.is_empty());
+    app.handle_key(ctrl_key('h'));
+    assert!(app.slash_candidates.is_empty());
+    assert_eq!(app.input, "");
+}
+
+#[test]
+fn ctrl_k_deletes_to_end() {
+    let mut app = App::new();
+    app.handle_key(key_char('h'));
+    app.handle_key(key_char('e'));
+    app.handle_key(key_char('l'));
+    app.handle_key(key_char('l'));
+    app.handle_key(key_char('o'));
+    // Move cursor to position 2 (between 'l' and 'l')
+    app.handle_key(key(KeyCode::Left));
+    app.handle_key(key(KeyCode::Left));
+    app.handle_key(key(KeyCode::Left));
+    assert_eq!(app.cursor_position, 2);
+    app.handle_key(ctrl_key('k'));
+    assert_eq!(app.input, "he");
+    assert_eq!(app.cursor_position, 2);
+}
+
+#[test]
+fn ctrl_k_at_end_does_nothing() {
+    let mut app = App::new();
+    app.handle_key(key_char('h'));
+    app.handle_key(key_char('i'));
+    app.handle_key(ctrl_key('k'));
+    assert_eq!(app.input, "hi");
+    assert_eq!(app.cursor_position, 2);
+}
+
+#[test]
+fn ctrl_d_deletes_char_at_cursor() {
+    let mut app = App::new();
+    app.handle_key(key_char('a'));
+    app.handle_key(key_char('b'));
+    app.handle_key(key_char('c'));
+    // Move cursor left twice: position 1 (between 'a' and 'b')
+    app.handle_key(key(KeyCode::Left));
+    app.handle_key(key(KeyCode::Left));
+    assert_eq!(app.cursor_position, 1);
+    app.handle_key(ctrl_key('d'));
+    assert_eq!(app.input, "ac");
+    assert_eq!(app.cursor_position, 1);
+}
+
+#[test]
+fn ctrl_d_at_end_does_nothing() {
+    let mut app = App::new();
+    app.handle_key(key_char('h'));
+    app.handle_key(key_char('i'));
+    app.handle_key(ctrl_key('d'));
+    assert_eq!(app.input, "hi");
+    assert_eq!(app.cursor_position, 2);
+}
+
+#[test]
+fn ctrl_d_updates_slash_candidates() {
+    let mut app = App::new();
+    app.handle_key(key_char('/'));
+    app.handle_key(key_char('e'));
+    app.handle_key(key_char('x'));
+    app.handle_key(key_char('i'));
+    app.handle_key(key_char('t'));
+    // Input is "/exit", cursor at end. Move to start.
+    app.handle_key(key(KeyCode::Home));
+    assert_eq!(app.cursor_position, 0);
+    app.handle_key(ctrl_key('d'));
+    // Deletes the '/' — input becomes "exit", candidates cleared
+    assert_eq!(app.input, "exit");
+    assert!(app.slash_candidates.is_empty());
+}
+
+#[test]
+fn ctrl_k_updates_slash_candidates() {
+    let mut app = App::new();
+    app.handle_key(key_char('/'));
+    app.handle_key(key_char('e'));
+    app.handle_key(key_char('x'));
+    app.handle_key(key_char('i'));
+    app.handle_key(key_char('t'));
+    // Move cursor to after "/e"
+    app.handle_key(key(KeyCode::Left));
+    app.handle_key(key(KeyCode::Left));
+    app.handle_key(key(KeyCode::Left));
+    assert_eq!(app.input, "/exit");
+    assert_eq!(app.cursor_position, 2);
+    app.handle_key(ctrl_key('k'));
+    assert_eq!(app.input, "/e");
+    // Candidates should still include "exit" since "/e" matches
+    assert_eq!(app.slash_candidates.len(), 1);
+}
+
+#[test]
+fn ctrl_n_p_cycle_candidates() {
+    let mut app = App::new();
+    app.handle_key(key_char('/'));
+    // With 1 candidate (exit), cycling wraps to 0
+    assert_eq!(app.slash_selected, 0);
+    app.handle_key(ctrl_key('n'));
+    assert_eq!(app.slash_selected, 0);
+    app.handle_key(ctrl_key('p'));
     assert_eq!(app.slash_selected, 0);
 }
 
