@@ -441,7 +441,9 @@ impl BashSession {
                 return Ok(());
             };
             match std::process::Command::new("/bin/kill")
-                .args(["-KILL", &format!("-{pgid}")])
+                // procps-ng requires `--` before a negative pgid so it is not
+                // parsed as another option (`kill -KILL -<pgid>` is a no-op).
+                .args(["-KILL", "--", &format!("-{pgid}")])
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
