@@ -27,10 +27,18 @@
       version =
         let
           d = inputs.self.lastModifiedDate;
-          date = "${builtins.substring 0 4 d}.${builtins.substring 4 2 d}.${builtins.substring 6 2 d}";
+          dezero =
+            s:
+            let
+              m = builtins.match "0(.*)" s;
+            in
+            if m == null then s else builtins.head m;
+          date = "${builtins.substring 0 4 d}.${dezero (builtins.substring 4 2 d)}.${
+            dezero (builtins.substring 6 2 d)
+          }";
           rev = inputs.self.shortRev or inputs.self.dirtyShortRev or "dirty";
         in
-        "v${date}-${rev}";
+        "${date}-${rev}";
     in
     inputs.flake-parts.lib.mkFlake { inherit inputs; } {
       systems = [
