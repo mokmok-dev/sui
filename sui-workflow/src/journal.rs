@@ -9,10 +9,7 @@ use std::{
 
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 
-use crate::{
-    AgentRequest, AgentResult, WorkflowError,
-    hash::ContentHash,
-};
+use crate::{AgentRequest, AgentResult, WorkflowError, hash::ContentHash};
 
 /// The durable state of one slot in a parallel panel.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -327,9 +324,7 @@ impl Journal {
                     for slot in slots {
                         let should_retry = match slot {
                             ParallelSlot::Pending => false,
-                            ParallelSlot::Completed {
-                                result: None, ..
-                            } => true,
+                            ParallelSlot::Completed { result: None, .. } => true,
                             ParallelSlot::Completed {
                                 result: Some(result),
                                 ..
@@ -419,9 +414,7 @@ impl Journal {
     }
 }
 
-pub fn panel_content_hash(
-    requests: &[AgentRequest],
-) -> Result<ContentHash, serde_json::Error> {
+pub fn panel_content_hash(requests: &[AgentRequest]) -> Result<ContentHash, serde_json::Error> {
     crate::hash::hash_json(&serde_json::to_value(requests)?)
 }
 
@@ -445,14 +438,12 @@ pub fn gate_content_hash(
     }))
 }
 
-pub fn result_content_hash(
-    result: &AgentResult,
-) -> Result<ContentHash, serde_json::Error> {
+pub fn result_content_hash(result: &AgentResult) -> Result<ContentHash, serde_json::Error> {
     crate::hash::hash_json(&serde_json::to_value(result)?)
 }
 
 pub fn optional_result_content_hash(
-    result: Option<&AgentResult>,
+    result: Option<&AgentResult>
 ) -> Result<ContentHash, serde_json::Error> {
     crate::hash::hash_json(&serde_json::to_value(result)?)
 }

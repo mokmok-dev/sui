@@ -265,10 +265,7 @@ complete(#{ ok: true });
 "#;
     let error = run_with_host(ReadOnlyHost, script, RunOptions::default())
         .expect_err("execute must be denied");
-    assert!(matches!(
-        error,
-        WorkflowError::CapabilityDenied { .. }
-    ));
+    assert!(matches!(error, WorkflowError::CapabilityDenied { .. }));
 }
 
 #[test]
