@@ -1,4 +1,4 @@
-use crate::slash::{MAX_CANDIDATES, SlashCandidate};
+use crate::slash::{MAX_CANDIDATES, SlashCandidate, SlashCommand};
 use ratatui::{
     DefaultTerminal, Frame,
     layout::{Constraint, Direction, Layout},
@@ -28,6 +28,8 @@ pub struct App {
     pub(crate) prompt_prefix: String,
     /// History of submitted prompt texts shown in the main content area.
     pub(crate) messages: Vec<String>,
+    /// Registered pluggable slash commands.
+    pub(crate) plugins: Vec<Box<dyn SlashCommand>>,
     /// Candidates that match the current slash partial input.
     pub(crate) slash_candidates: Vec<SlashCandidate>,
     /// Currently highlighted index within `slash_candidates`.
@@ -50,6 +52,7 @@ impl App {
             should_quit: false,
             prompt_prefix: "❯ ".to_string(),
             messages: Vec::new(),
+            plugins: Vec::new(),
             slash_candidates: Vec::new(),
             slash_selected: 0,
         }
@@ -66,6 +69,17 @@ impl App {
         msg: impl Into<String>,
     ) {
         self.messages.push(msg.into());
+    }
+
+    /// Register a pluggable slash command.
+    ///
+    /// Built-in `/exit` is always available. Commands registered here appear
+    /// alongside it in the suggestion panel.
+    pub fn register_command(
+        &mut self,
+        cmd: impl SlashCommand + 'static,
+    ) {
+        self.plugins.push(Box::new(cmd));
     }
 
     /// Sets the prompt prefix.

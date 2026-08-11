@@ -8,11 +8,69 @@ use ratatui::{
 
 pub const MAX_CANDIDATES: usize = 5;
 
+/// A pluggable slash command.
+///
+/// Implement this trait and register with [`App::register_command`] to add
+/// custom slash commands.
+///
+/// # Example
+///
+/// ```
+/// use sui_app::{App, SlashCommand};
+///
+/// struct Hello;
+///
+/// impl SlashCommand for Hello {
+///     fn name(&self) -> &'static str { "hello" }
+///     fn description(&self) -> &'static str { "print a greeting" }
+///     fn execute(&self, app: &mut App) {
+///         app.add_message("hello, world!");
+///     }
+/// }
+///
+/// let mut app = App::new();
+/// app.register_command(Hello);
+/// ```
+pub trait SlashCommand {
+    /// The command name as typed after `/` (e.g. `"skill"` for `/skill`).
+    fn name(&self) -> &'static str;
+
+    /// A short description shown in the suggestion panel.
+    fn description(&self) -> &'static str;
+
+    /// Called when the user selects and executes this command.
+    fn execute(
+        &self,
+        app: &mut App,
+    );
+}
+
 /// Internal representation of a single suggestion entry.
 #[derive(Clone, Debug)]
 pub(crate) enum SlashCandidate {
     /// The built-in `/exit` command.
     Builtin,
+    /// Index into [`App::plugins`].
+    Plugin { index: usize },
+}
+
+/// No-op command used as a placeholder during plugin execution.
+pub(crate) struct NoopCommand;
+
+impl SlashCommand for NoopCommand {
+    fn name(&self) -> &'static str {
+        ""
+    }
+
+    fn description(&self) -> &'static str {
+        ""
+    }
+
+    fn execute(
+        &self,
+        _app: &mut App,
+    ) {
+    }
 }
 
 impl App {
@@ -28,6 +86,10 @@ impl App {
         for (i, candidate) in self.slash_candidates.iter().enumerate() {
             let (name, desc) = match candidate {
                 SlashCandidate::Builtin => ("exit", "quit the application"),
+                SlashCandidate::Plugin { index } => {
+                    let cmd = &self.plugins[*index];
+                    (cmd.name(), cmd.description())
+                },
             };
             let text = format!(" /{name} — {desc}");
             let style = if i == self.slash_selected {
@@ -50,8 +112,20 @@ impl App {
         if let Some(partial) = self.input.strip_prefix('/') {
             self.slash_candidates.clear();
 
+            // Built-in "/exit" always checked first.
             if "exit".starts_with(partial) {
                 self.slash_candidates.push(SlashCandidate::Builtin);
+            }
+
+            // Plugin commands.
+            for (i, cmd) in self.plugins.iter().enumerate() {
+                if self.slash_candidates.len() >= MAX_CANDIDATES {
+                    break;
+                }
+                if cmd.name().starts_with(partial) {
+                    self.slash_candidates
+                        .push(SlashCandidate::Plugin { index: i });
+                }
             }
 
             let len = self.slash_candidates.len().max(1);
@@ -66,8 +140,23 @@ impl App {
 
     /// Executes the currently highlighted slash candidate.
     pub(crate) fn execute_selected_slash_command(&mut self) {
-        match self.slash_candidates[self.slash_selected] {
-            SlashCandidate::Builtin => self.quit(),
+        // Extract the action outside the borrow scope.
+        let action = {
+            let candidate = &self.slash_candidates[self.slash_selected];
+            match candidate {
+                SlashCandidate::Builtin => None,
+                SlashCandidate::Plugin { index } => Some(*index),
+            }
+        };
+        match action {
+            None => self.quit(),
+            Some(index) => {
+                // Temporarily swap out the command so we can call
+                // execute(&mut self) without conflicting borrows.
+                let cmd = std::mem::replace(&mut self.plugins[index], Box::new(NoopCommand));
+                cmd.execute(self);
+                self.plugins[index] = cmd;
+            },
         }
     }
 
@@ -75,6 +164,7 @@ impl App {
     pub(crate) fn selected_candidate_name(&self) -> &'static str {
         match &self.slash_candidates[self.slash_selected] {
             SlashCandidate::Builtin => "exit",
+            SlashCandidate::Plugin { index } => self.plugins[*index].name(),
         }
     }
 

@@ -8,6 +8,7 @@ pub mod input;
 pub mod slash;
 
 pub use app::App;
+pub use slash::SlashCommand;
 
 /// Converts a char-based index into a byte offset within `s`.
 ///
