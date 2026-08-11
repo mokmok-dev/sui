@@ -131,6 +131,59 @@ fn journal_round_trips_through_json() -> Result<(), WorkflowError> {
 }
 
 #[test]
+fn resume_from_checkpoint_file_matches_original_run() -> Result<(), WorkflowError> {
+    use std::{
+        fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    let path = std::env::temp_dir().join(format!(
+        "sui-workflow-resume-{}-{}.json",
+        std::process::id(),
+        stamp
+    ));
+
+    let first = run_with_host(
+        EchoHost,
+        DEMO,
+        RunOptions {
+            args: Some(json!({ "topic": "hashing" })),
+            checkpoint: Some(path.clone()),
+            ..RunOptions::default()
+        },
+    )?;
+
+    let on_disk = fs::read_to_string(&path).map_err(|error| WorkflowError::io(&path, error))?;
+    let loaded = Journal::from_json(&on_disk)?;
+    assert_eq!(loaded, first.journal);
+    assert_eq!(loaded.workflow_hash(), Some(&first.workflow_hash));
+    assert_eq!(loaded.input_hash(), Some(&first.input_hash));
+
+    let second = run_with_host(
+        EchoHost,
+        DEMO,
+        RunOptions {
+            args: Some(json!({ "topic": "hashing" })),
+            journal: loaded,
+            ..RunOptions::default()
+        },
+    )?;
+
+    assert_eq!(second.complete, first.complete);
+    assert_eq!(second.workflow_hash, first.workflow_hash);
+    assert_eq!(second.input_hash, first.input_hash);
+    assert_eq!(second.journal, first.journal);
+    assert_eq!(second.phases, first.phases);
+    assert_eq!(second.logs, first.logs);
+
+    let _ = fs::remove_file(&path);
+    Ok(())
+}
+
+#[test]
 fn rejects_resume_when_prompt_request_hash_changes() -> Result<(), WorkflowError> {
     let first = run_with_host(
         EchoHost,
