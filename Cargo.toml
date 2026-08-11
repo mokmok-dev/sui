@@ -1,13 +1,18 @@
 [workspace]
-members = ["sui", "sui-app", "sui-widget"]
+members = ["sui", "sui-app", "sui-widget", "sui-workflow"]
 resolver = "3"
 
 [workspace.dependencies]
 color-eyre = "0.6.5"
 crossterm = "0.29.0"
 ratatui = { version = "0.30.2", default-features = false }
+rhai = { version = "1.23.6", features = ["no_time", "serde"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+sha2 = "0.11.0"
 sui-app = { path = "./sui-app" }
 sui-widget = { path = "./sui-widget" }
+sui-workflow = { path = "./sui-workflow" }
 thiserror = "2.0.20"
 tokio = "1.53.1"
 unicode-width = "0.2.2"
