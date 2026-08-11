@@ -24,7 +24,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
-use crate::{BashSession, Bm25Index, ProcessState, ToolsError, bash::validate_single_line};
+use crate::{BashSession, LexicalSearch, ProcessState, ToolsError, bash::validate_single_line};
 
 /// Hard upper bound for `code_search` `limit`.
 pub const MAX_SEARCH_LIMIT: usize = 100;
@@ -120,16 +120,20 @@ impl ToolRegistry {
     }
 }
 
-/// BM25 code search tool (`code_search`).
+/// Lexical code search tool (`code_search`).
+///
+/// Backend-agnostic: any [`LexicalSearch`] (in-memory BM25 or Tantivy).
 pub struct CodeSearchTool {
-    index: Arc<Bm25Index>,
+    index: Arc<dyn LexicalSearch>,
 }
 
 impl CodeSearchTool {
-    /// Wraps an existing BM25 index.
+    /// Wraps an existing lexical index backend.
     #[must_use]
-    pub const fn new(index: Arc<Bm25Index>) -> Self {
-        Self { index }
+    pub fn new(index: impl LexicalSearch + 'static) -> Self {
+        Self {
+            index: Arc::new(index),
+        }
     }
 }
 
@@ -141,7 +145,7 @@ impl Tool for CodeSearchTool {
 
     #[allow(clippy::unnecessary_literal_bound)]
     fn description(&self) -> &str {
-        "BM25 lexical search over the indexed local codebase. Prefer this over blind filesystem exploration."
+        "Lexical (BM25-ish) search over the indexed local codebase. Prefer this over blind filesystem exploration."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -409,7 +413,7 @@ fn process_state_json(state: ProcessState) -> Value {
 
 /// Builds a registry with `code_search` only (no bash spawn).
 #[must_use]
-pub fn code_search_registry(index: Arc<Bm25Index>) -> ToolRegistry {
+pub fn code_search_registry(index: impl LexicalSearch + 'static) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     registry.register(CodeSearchTool::new(index));
     registry
@@ -422,7 +426,7 @@ pub fn code_search_registry(index: Arc<Bm25Index>) -> ToolRegistry {
 /// Returns an error if the bash session cannot be spawned.
 /// Prefer [`code_search_registry`] when bash is unavailable or unwanted.
 pub fn builtin_registry(
-    index: Arc<Bm25Index>,
+    index: impl LexicalSearch + 'static,
     bash_cwd: Option<&std::path::Path>,
 ) -> Result<ToolRegistry, ToolsError> {
     let mut registry = code_search_registry(index);
@@ -433,6 +437,7 @@ pub fn builtin_registry(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Bm25Index;
 
     async fn poll_until_stdout(
         registry: &ToolRegistry,
@@ -465,7 +470,7 @@ mod tests {
         let mut index = Bm25Index::default();
         index.add_document("a", "auth.rs", "authenticate password");
         index.add_document("b", "ui.rs", "render widget");
-        let tool = CodeSearchTool::new(Arc::new(index));
+        let tool = CodeSearchTool::new(index);
 
         let mut registry = ToolRegistry::new();
         registry.register(tool);
@@ -511,7 +516,7 @@ mod tests {
 
     #[tokio::test]
     async fn bash_drain_false_and_actions() -> Result<(), ToolsError> {
-        let registry = builtin_registry(Arc::new(Bm25Index::default()), None)?;
+        let registry = builtin_registry(Bm25Index::default(), None)?;
         assert_eq!(
             registry.names(),
             vec!["bash".to_owned(), "code_search".to_owned()]
@@ -657,7 +662,7 @@ mod tests {
 
     #[tokio::test]
     async fn code_search_invalid_args() {
-        let tool = CodeSearchTool::new(Arc::new(Bm25Index::default()));
+        let tool = CodeSearchTool::new(Bm25Index::default());
         let mut registry = ToolRegistry::new();
         registry.register(tool);
 
@@ -684,7 +689,7 @@ mod tests {
         for i in 0..5 {
             index.add_document(format!("d{i}"), format!("f{i}.rs"), "shared_term unique");
         }
-        let registry = code_search_registry(Arc::new(index));
+        let registry = code_search_registry(index);
         let result = registry
             .call(
                 "code_search",
@@ -694,6 +699,36 @@ mod tests {
         let hits = result["hits"].as_array().expect("hits");
         assert!(hits.len() <= MAX_SEARCH_LIMIT);
         assert_eq!(hits.len(), 5);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn code_search_accepts_tantivy_backend() -> Result<(), ToolsError> {
+        use crate::TantivyIndex;
+        use crate::corpus::{TempDir, temp_dir};
+        use std::fs;
+
+        let src = TempDir(temp_dir("tool-tv-src"));
+        let idx = TempDir(temp_dir("tool-tv-idx"));
+        fs::create_dir_all(src.0.join("src")).map_err(|source| ToolsError::io(&src.0, source))?;
+        fs::write(src.0.join("src/auth.rs"), "fn authenticate_password() {}")
+            .map_err(|source| ToolsError::io(src.0.join("src/auth.rs"), source))?;
+
+        let index = TantivyIndex::index_tree(&idx.0, &src.0, &["rs"])?;
+        let registry = code_search_registry(index);
+        let result = registry
+            .call(
+                "code_search",
+                json!({ "query": "authenticate", "limit": 3 }),
+            )
+            .await?;
+        let hits = result["hits"].as_array().expect("hits");
+        assert_eq!(hits.len(), 1);
+        assert!(
+            hits[0]["path"]
+                .as_str()
+                .is_some_and(|p| p.ends_with("auth.rs"))
+        );
         Ok(())
     }
 

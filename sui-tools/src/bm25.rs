@@ -11,57 +11,45 @@
 //!
 //! # Symlink policy
 //!
-//! Directory walks **do not follow symlinks** (`file_type` from `DirEntry` is
-//! used; symlink-to-dir and symlink-to-file entries are skipped). This avoids
-//! escaping the indexed tree via symlink roots. Callers that need symlink
-//! follow should canonicalize externally and pass a real path.
+//! Directory walks **do not follow symlinks** (see [`crate::corpus`]).
 
-use std::{
-    collections::{HashMap, HashSet},
-    fs,
-    io::Read,
-    path::Path,
+use std::collections::{HashMap, HashSet};
+
+use crate::{
+    ToolsError,
+    corpus::{VisitControl, make_snippet, visit_code_files},
 };
-
-use crate::ToolsError;
 
 /// Default Okapi BM25 term-frequency saturation parameter.
 pub const DEFAULT_K1: f64 = 1.2;
 /// Default Okapi BM25 length-normalization parameter.
 pub const DEFAULT_B: f64 = 0.75;
 
-/// Maximum bytes read from a single source file during [`Bm25Index::index_tree`].
-pub const MAX_FILE_BYTES: u64 = 1_048_576; // 1 MiB
-/// Maximum number of documents retained in one index built by [`Bm25Index::index_tree`].
-pub const MAX_INDEX_DOCS: usize = 10_000;
-/// Preview length (chars) stored on each [`SearchHit`].
-pub const SNIPPET_CHARS: usize = 240;
+pub use crate::corpus::{MAX_FILE_BYTES, MAX_INDEX_DOCS, SNIPPET_CHARS};
 
-/// Directory names skipped while walking a tree.
-const SKIP_DIRS: &[&str] = &[
-    "target",
-    "node_modules",
-    "vendor",
-    "__pycache__",
-    "dist",
-    ".git",
-];
-
-/// File name suffixes treated as likely secrets and skipped.
-const SKIP_SECRET_SUFFIXES: &[&str] = &[".pem", ".key", ".p12", ".pfx"];
-// `.env` and `.env.*` (any suffix) are skipped via [`is_secret_path`].
-
-/// A ranked search hit.
+/// A ranked search hit shared by lexical backends.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct SearchHit {
     /// Stable document identifier (often the path).
     pub doc_id: String,
     /// Source path associated with the document, if any.
     pub path: String,
-    /// BM25 score (higher is better).
+    /// Relevance score (higher is better; BM25-ish).
     pub score: f64,
     /// Short text preview for agent context (first [`SNIPPET_CHARS`] chars).
     pub snippet: String,
+}
+
+/// Agent-facing lexical search surface used by [`crate::CodeSearchTool`].
+///
+/// Construction / indexing stays backend-specific; callers only need [`search`].
+pub trait LexicalSearch: Send + Sync {
+    /// Returns up to `limit` hits, highest score first.
+    fn search(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Vec<SearchHit>;
 }
 
 /// In-memory Okapi BM25 index over `(path, text)` documents.
@@ -149,16 +137,9 @@ impl Bm25Index {
         }
     }
 
-    /// Indexes UTF-8 text files under `root` whose extension is in `extensions`
-    /// (compared without a leading dot, case-insensitive).
+    /// Indexes UTF-8 text files under `root` whose extension is in `extensions`.
     ///
-    /// **Skips** (does not fail the walk):
-    /// - unreadable files / non-UTF-8 contents
-    /// - files larger than [`MAX_FILE_BYTES`]
-    /// - likely secret filenames (`.env`, `.env.*`, `*.pem`, …)
-    /// - directories in [`SKIP_DIRS`], and any directory whose name starts with `.`
-    /// - symlinks (see module symlink policy)
-    ///
+    /// See [`visit_code_files`] for skip / size / symlink policy.
     /// Stops adding documents once [`MAX_INDEX_DOCS`] is reached.
     ///
     /// # Errors
@@ -166,45 +147,17 @@ impl Bm25Index {
     /// Returns [`ToolsError::Io`] only when the root directory itself cannot be
     /// read. Per-file failures are skipped.
     pub fn index_tree(
-        root: &Path,
+        root: &std::path::Path,
         extensions: &[&str],
     ) -> Result<Self, ToolsError> {
         let mut index = Self::default();
-        let ext_set: HashSet<String> = extensions
-            .iter()
-            .map(|ext| ext.trim_start_matches('.').to_ascii_lowercase())
-            .collect();
-        walk_files(root, &mut |path| {
+        visit_code_files(root, extensions, |path, text| {
             if index.len() >= MAX_INDEX_DOCS {
-                return Ok(WalkControl::Stop);
+                return Ok(VisitControl::Stop);
             }
-            let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
-                return Ok(WalkControl::Continue);
-            };
-            if !ext_set.contains(&ext.to_ascii_lowercase()) {
-                return Ok(WalkControl::Continue);
-            }
-            if is_secret_path(path) {
-                return Ok(WalkControl::Continue);
-            }
-            // Bound the read to avoid TOCTOU growth past metadata.len().
-            let Ok(file) = fs::File::open(path) else {
-                return Ok(WalkControl::Continue);
-            };
-            let mut limited = file.take(MAX_FILE_BYTES.saturating_add(1));
-            let mut bytes = Vec::new();
-            if limited.read_to_end(&mut bytes).is_err() {
-                return Ok(WalkControl::Continue);
-            }
-            if bytes.len() as u64 > MAX_FILE_BYTES {
-                return Ok(WalkControl::Continue);
-            }
-            let Ok(text) = String::from_utf8(bytes) else {
-                return Ok(WalkControl::Continue);
-            };
             let path_str = path.to_string_lossy().into_owned();
-            index.add_document(path_str.clone(), path_str, &text);
-            Ok(WalkControl::Continue)
+            index.add_document(path_str.clone(), path_str, text);
+            Ok(VisitControl::Continue)
         })?;
         Ok(index)
     }
@@ -272,9 +225,14 @@ impl Bm25Index {
     }
 }
 
-enum WalkControl {
-    Continue,
-    Stop,
+impl LexicalSearch for Bm25Index {
+    fn search(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Vec<SearchHit> {
+        Self::search(self, query, limit)
+    }
 }
 
 /// Lucene-style BM25 IDF: `ln(1 + (N - df + 0.5) / (df + 0.5))`.
@@ -283,40 +241,6 @@ fn idf(
     df: f64,
 ) -> f64 {
     ((n - df + 0.5) / (df + 0.5)).ln_1p()
-}
-
-fn make_snippet(text: &str) -> String {
-    let trimmed = text.trim();
-    let mut snippet = String::new();
-    for (i, ch) in trimmed.chars().enumerate() {
-        if i >= SNIPPET_CHARS {
-            snippet.push('…');
-            break;
-        }
-        if ch == '\n' || ch == '\r' {
-            snippet.push(' ');
-        } else {
-            snippet.push(ch);
-        }
-    }
-    snippet
-}
-
-fn is_secret_path(path: &Path) -> bool {
-    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-        return false;
-    };
-    let lower = name.to_ascii_lowercase();
-    if lower == ".env" || lower.starts_with(".env.") {
-        return true;
-    }
-    SKIP_SECRET_SUFFIXES
-        .iter()
-        .any(|suffix| lower.ends_with(suffix))
-}
-
-fn should_skip_dir(name: &str) -> bool {
-    name.starts_with('.') || SKIP_DIRS.contains(&name)
 }
 
 /// Code-aware tokenization: split on non-alphanumeric boundaries, then split
@@ -341,7 +265,9 @@ pub fn tokenize(text: &str) -> Vec<String> {
     tokens
 }
 
-fn unique_tokens(text: &str) -> Vec<String> {
+/// Unique tokens in first-seen order (shared with the Tantivy query path).
+#[must_use]
+pub(crate) fn unique_tokens(text: &str) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
     for token in tokenize(text) {
@@ -388,76 +314,11 @@ fn push_lower_token(
     out.push(token);
 }
 
-fn walk_files(
-    root: &Path,
-    visit: &mut dyn FnMut(&Path) -> Result<WalkControl, ToolsError>,
-) -> Result<(), ToolsError> {
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let entries = match fs::read_dir(&dir) {
-            Ok(entries) => entries,
-            Err(source) if dir == root => {
-                return Err(ToolsError::io(&dir, source));
-            },
-            Err(_) => continue,
-        };
-        for entry in entries {
-            let Ok(entry) = entry else {
-                continue;
-            };
-            let path = entry.path();
-            let Ok(file_type) = entry.file_type() else {
-                continue;
-            };
-            // Symlink policy: do not follow (skip symlink dirs/files).
-            if file_type.is_symlink() {
-                continue;
-            }
-            if file_type.is_dir() {
-                let skip = path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(should_skip_dir);
-                if !skip {
-                    stack.push(path);
-                }
-            } else if file_type.is_file() {
-                match visit(&path)? {
-                    WalkControl::Continue => {},
-                    WalkControl::Stop => return Ok(()),
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
-
-    fn temp_dir(label: &str) -> std::path::PathBuf {
-        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos());
-        let dir = std::env::temp_dir().join(format!(
-            "sui-tools-bm25-{label}-{}-{nanos}-{seq}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&dir);
-        dir
-    }
-
-    struct TempDir(std::path::PathBuf);
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
+    use crate::corpus::{TempDir, temp_dir};
+    use std::fs;
 
     #[test]
     fn tokenize_splits_camel_and_snake() {
@@ -491,7 +352,7 @@ mod tests {
             "fn hash_password(password: &str) -> Digest { blake3(password) }",
         );
 
-        let hits = index.search("password authenticate", 3);
+        let hits = LexicalSearch::search(&index, "password authenticate", 3);
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].path, "auth.rs");
         assert_eq!(hits[1].path, "password.rs");
@@ -629,15 +490,5 @@ mod tests {
         assert!(index.search("zz_envstaging_unique_marker", 5).is_empty());
         assert_eq!(index.len(), 1, "huge + env files must be skipped");
         Ok(())
-    }
-
-    #[test]
-    fn is_secret_path_matches_env_glob() {
-        assert!(is_secret_path(Path::new("/x/.env")));
-        assert!(is_secret_path(Path::new("/x/.env.local")));
-        assert!(is_secret_path(Path::new("/x/.env.staging")));
-        assert!(is_secret_path(Path::new("/x/cert.pem")));
-        assert!(!is_secret_path(Path::new("/x/env.rs")));
-        assert!(!is_secret_path(Path::new("/x/.environment")));
     }
 }
