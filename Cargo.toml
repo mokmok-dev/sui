@@ -1,5 +1,5 @@
 [workspace]
-members = ["sui", "sui-app", "sui-widget", "sui-workflow"]
+members = ["sui", "sui-app", "sui-tools", "sui-widget", "sui-workflow"]
 resolver = "3"
 
 [workspace.dependencies]
@@ -11,6 +11,7 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 sha2 = "0.11.0"
 sui-app = { path = "./sui-app" }
+sui-tools = { path = "./sui-tools" }
 sui-widget = { path = "./sui-widget" }
 sui-workflow = { path = "./sui-workflow" }
 thiserror = "2.0.20"

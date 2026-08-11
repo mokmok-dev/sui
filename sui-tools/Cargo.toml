@@ -1,0 +1,32 @@
+[package]
+description = "Agent tool-calling foundation: BM25 code search, async bash sessions, and a thin tool registry."
+edition.workspace = true
+name = "sui-tools"
+version.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = [
+  "io-util",
+  "macros",
+  "process",
+  "rt",
+  "sync",
+  "time",
+] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = [
+  "io-util",
+  "macros",
+  "process",
+  "rt",
+  "rt-multi-thread",
+  "sync",
+  "time",
+] }
+
+[lints]
+workspace = true
