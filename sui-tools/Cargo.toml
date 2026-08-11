@@ -1,5 +1,5 @@
 [package]
-description = "Agent tool-calling foundation: BM25 code search, async bash sessions, and a thin tool registry."
+description = "Agent tool-calling foundation: lexical code search (in-memory BM25 + Tantivy), async bash sessions, and a thin tool registry."
 edition.workspace = true
 name = "sui-tools"
 version.workspace = true
@@ -7,6 +7,7 @@ version.workspace = true
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
+tantivy = "0.26.1"
 thiserror = { workspace = true }
 tokio = { workspace = true, features = [
   "io-util",

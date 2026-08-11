@@ -4,7 +4,7 @@
 //! cargo run -p sui-tools --example smoke_builtin -- /path/to/repo
 //! ```
 
-use std::{env, path::PathBuf, sync::Arc, time::Duration};
+use std::{env, path::PathBuf, time::Duration};
 
 use serde_json::json;
 use sui_tools::{Bm25Index, ToolsError, builtin_registry};
@@ -17,10 +17,10 @@ async fn main() -> Result<(), ToolsError> {
     };
 
     println!("indexing {} …", root.display());
-    let index = Arc::new(Bm25Index::index_tree(&root, &["rs", "toml", "md", "rhai"])?);
+    let index = Bm25Index::index_tree(&root, &["rs", "toml", "md", "rhai"])?;
     println!("indexed {} documents", index.len());
 
-    let registry = builtin_registry(Arc::clone(&index), Some(&root))?;
+    let registry = builtin_registry(index, Some(&root))?;
     println!("tools: {:?}", registry.names());
     println!(
         "descriptors: {}",
