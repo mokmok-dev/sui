@@ -14,7 +14,5 @@ async fn main() -> Result<(), MainError> {
     color_eyre::install().map_err(MainError::from)?;
 
     let mut app = App::new();
-    ratatui::run(|terminal| app.run(terminal)).map_err(MainError::from)?;
-
-    Ok(())
+    app.run_inline().map_err(MainError::from)
 }

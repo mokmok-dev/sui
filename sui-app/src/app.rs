@@ -1,12 +1,21 @@
 use crate::slash::{MAX_CANDIDATES, SlashCandidate, SlashCommand};
 use ratatui::{
-    DefaultTerminal, Frame,
-    layout::{Constraint, Direction, Layout},
-    style::{Color, Style},
-    text::Text,
-    widgets::{Block, Borders, Paragraph},
+    DefaultTerminal, Frame, Terminal, TerminalOptions, Viewport,
+    backend::{Backend, CrosstermBackend},
+    layout::{Constraint, Layout, Position},
+    widgets::{Paragraph, Widget},
 };
 use sui_widget::PromptWidget;
+
+/// Rows occupied by the bordered prompt widget.
+pub const PROMPT_HEIGHT: u16 = 3;
+
+/// Extra inline rows reserved while the slash-suggestion panel is open.
+///
+/// Kept as a `u16` literal (not `MAX_CANDIDATES as u16`) to satisfy pedantic
+/// cast lints; the assert below locks it to [`MAX_CANDIDATES`].
+const SUGGESTION_PANEL_HEIGHT: u16 = 5;
+const _: () = assert!(SUGGESTION_PANEL_HEIGHT as usize == MAX_CANDIDATES);
 
 /// Holds the full application state: prompt input, submitted messages, and the
 /// run-loop flag.
@@ -17,8 +26,8 @@ use sui_widget::PromptWidget;
 /// use sui_app::App;
 ///
 /// let mut app = App::new();
-/// // Optionally customise the prompt:
-/// let mut app = App::new().with_prompt_prefix("> ");
+/// app.run_inline()?;
+/// # Ok::<(), std::io::Error>(())
 /// ```
 pub struct App {
     pub(crate) input: String,
@@ -26,8 +35,16 @@ pub struct App {
     pub(crate) cursor_position: usize,
     pub(crate) should_quit: bool,
     pub(crate) prompt_prefix: String,
-    /// History of submitted prompt texts shown in the main content area.
+    /// History of submitted prompts / status lines.
+    ///
+    /// New entries are committed above the inline viewport via
+    /// [`Terminal::insert_before`] so they scroll into the terminal scrollback
+    /// while the prompt stays pinned once it reaches the bottom of the screen.
     pub(crate) messages: Vec<String>,
+    /// How many messages have already been written above the viewport.
+    pub(crate) flushed_messages: usize,
+    /// Current [`Viewport::Inline`] height managed by [`App::run`].
+    pub(crate) viewport_height: u16,
     /// Registered pluggable slash commands.
     pub(crate) plugins: Vec<Box<dyn SlashCommand>>,
     /// Candidates that match the current slash partial input.
@@ -52,6 +69,8 @@ impl App {
             should_quit: false,
             prompt_prefix: "❯ ".to_string(),
             messages: Vec::new(),
+            flushed_messages: 0,
+            viewport_height: PROMPT_HEIGHT,
             plugins: Vec::new(),
             slash_candidates: Vec::new(),
             slash_selected: 0,
@@ -64,6 +83,9 @@ impl App {
     }
 
     /// Append a message to the message history.
+    ///
+    /// The next [`App::run`] iteration (or [`App::flush_messages`]) writes it
+    /// above the inline prompt into the terminal scrollback.
     pub fn add_message(
         &mut self,
         msg: impl Into<String>,
@@ -101,7 +123,42 @@ impl App {
         self
     }
 
-    /// Blocking run loop: draw → read event → update state → repeat until quit.
+    /// Inline viewport height for the current UI.
+    ///
+    /// Prompt-only while idle; expands by a fixed suggestion-panel budget when
+    /// any slash candidates are visible (avoids resizing on every keystroke).
+    #[must_use]
+    pub const fn inline_height(&self) -> u16 {
+        if self.slash_candidates.is_empty() {
+            PROMPT_HEIGHT
+        } else {
+            PROMPT_HEIGHT.saturating_add(SUGGESTION_PANEL_HEIGHT)
+        }
+    }
+
+    /// Initialize an inline terminal, run until quit, then restore the terminal.
+    ///
+    /// This is the preferred entry point: no alternate screen, prompt-only
+    /// viewport, scrollback via [`App::flush_messages`].
+    ///
+    /// # Errors
+    /// Returns an I/O error if terminal setup, the run loop, or restore fails.
+    pub fn run_inline(&mut self) -> std::io::Result<()> {
+        let mut terminal = ratatui::try_init_with_options(TerminalOptions {
+            viewport: Viewport::Inline(PROMPT_HEIGHT),
+        })?;
+        let result = self.run(&mut terminal);
+        ratatui::restore();
+        result
+    }
+
+    /// Blocking run loop: flush scrollback → sync viewport → draw → read event.
+    ///
+    /// Prefer [`App::run_inline`] unless you already own an inline
+    /// [`ratatui::Viewport`] terminal whose height starts at [`PROMPT_HEIGHT`].
+    ///
+    /// On exit the inline viewport is cleared and the cursor is moved to its
+    /// origin so the shell prompt does not overlap leftover TUI cells.
     ///
     /// # Errors
     /// Returns an I/O error if terminal operations or event reading fail.
@@ -109,10 +166,87 @@ impl App {
         &mut self,
         terminal: &mut DefaultTerminal,
     ) -> std::io::Result<()> {
+        let result = self.event_loop(terminal);
+        // Always tear down so Esc/`/exit` leave a clean normal-screen cursor.
+        let _ = Self::teardown_inline(terminal);
+        result
+    }
+
+    fn event_loop(
+        &mut self,
+        terminal: &mut DefaultTerminal,
+    ) -> std::io::Result<()> {
         while !self.should_quit {
+            self.flush_messages(terminal)?;
+            self.sync_viewport_height(terminal)?;
             terminal.draw(|frame| self.render(frame))?;
             self.handle_event(&crossterm::event::read()?);
         }
+        Ok(())
+    }
+
+    /// Clears the inline viewport and parks the cursor at its top-left origin.
+    ///
+    /// [`Terminal::clear`] restores the previous cursor position afterward, so
+    /// callers must move back to the viewport origin explicitly (same pattern
+    /// as Atuin’s inline-search teardown).
+    pub(crate) fn teardown_inline<B: Backend>(terminal: &mut Terminal<B>) -> Result<(), B::Error> {
+        let origin = terminal.get_frame().area().as_position();
+        terminal.clear()?;
+        terminal.set_cursor_position(origin)?;
+        Ok(())
+    }
+
+    /// Writes any unflushed messages above the inline viewport.
+    ///
+    /// Once the viewport reaches the bottom of the terminal, further inserts
+    /// scroll prior output into the scrollback buffer and keep the prompt pinned.
+    ///
+    /// # Errors
+    /// Returns a backend error if inserting lines fails.
+    pub fn flush_messages<B: Backend>(
+        &mut self,
+        terminal: &mut Terminal<B>,
+    ) -> Result<(), B::Error> {
+        while self.flushed_messages < self.messages.len() {
+            let line = format!(
+                "{}{}",
+                self.prompt_prefix, self.messages[self.flushed_messages]
+            );
+            terminal.insert_before(1, move |buf| {
+                Paragraph::new(line).render(buf.area, buf);
+            })?;
+            self.flushed_messages += 1;
+        }
+        Ok(())
+    }
+
+    /// Grows or shrinks the inline viewport to match [`App::inline_height`].
+    ///
+    /// Ratatui fixes [`Viewport::Inline`] height at construction time, so a
+    /// height change rebuilds the terminal on the normal screen (raw mode stays
+    /// enabled; only the viewport is replaced).
+    fn sync_viewport_height(
+        &mut self,
+        terminal: &mut DefaultTerminal,
+    ) -> std::io::Result<()> {
+        let height = self.inline_height();
+        if height == self.viewport_height {
+            return Ok(());
+        }
+
+        let area = terminal.get_frame().area();
+        terminal.clear()?;
+        terminal.set_cursor_position(Position::new(area.x, area.y))?;
+
+        let backend = CrosstermBackend::new(std::io::stdout());
+        *terminal = Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Inline(height),
+            },
+        )?;
+        self.viewport_height = height;
         Ok(())
     }
 
@@ -128,45 +262,20 @@ impl App {
             u16::try_from(self.slash_candidates.len().min(MAX_CANDIDATES)).unwrap_or(u16::MAX)
         };
 
-        let layout = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Min(1),
-                Constraint::Length(3),
-                Constraint::Length(suggestions_height),
-            ])
-            .split(area);
+        let [prompt_area, suggestions_area, _reserved] = Layout::vertical([
+            Constraint::Length(PROMPT_HEIGHT),
+            Constraint::Length(suggestions_height),
+            Constraint::Min(0),
+        ])
+        .areas(area);
 
-        // ---- main content area ----
-        let main_block = Block::default()
-            .borders(Borders::ALL)
-            .title(" sui ")
-            .style(Style::default().fg(Color::Green));
-
-        let content: Text<'_> = if self.messages.is_empty() {
-            Text::from("sui — 粋・推・遂\nType your prompt and press Enter to submit.")
-        } else {
-            let joined: String = self
-                .messages
-                .iter()
-                .map(|m| format!("❯ {m}"))
-                .collect::<Vec<_>>()
-                .join("\n");
-            Text::from(joined)
-        };
-
-        let main_paragraph = Paragraph::new(content).block(main_block);
-        frame.render_widget(main_paragraph, layout[0]);
-
-        // ---- prompt area ----
         let prompt = PromptWidget::new(&self.input, self.cursor_position, &self.prompt_prefix);
-        let cursor_pos = prompt.screen_cursor(layout[1]);
-        frame.render_widget(prompt, layout[1]);
+        let cursor_pos = prompt.screen_cursor(prompt_area);
+        frame.render_widget(prompt, prompt_area);
         frame.set_cursor_position((cursor_pos.0, cursor_pos.1));
 
-        // ---- slash-suggestions area ----
         if !self.slash_candidates.is_empty() {
-            self.render_slash_suggestions(frame, layout[2]);
+            self.render_slash_suggestions(frame, suggestions_area);
         }
     }
 }
