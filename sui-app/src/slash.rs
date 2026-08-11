@@ -8,6 +8,14 @@ use ratatui::{
 
 pub const MAX_CANDIDATES: usize = 5;
 
+/// Built-in slash commands: `(name, description)`.
+///
+/// `/exit` and `/quit` both shut down the application.
+const BUILTIN_COMMANDS: &[(&str, &str)] = &[
+    ("exit", "quit the application"),
+    ("quit", "quit the application"),
+];
+
 /// A pluggable slash command.
 ///
 /// Implement this trait and register with [`App::register_command`] to add
@@ -46,10 +54,10 @@ pub trait SlashCommand {
 }
 
 /// Internal representation of a single suggestion entry.
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) enum SlashCandidate {
-    /// The built-in `/exit` command.
-    Builtin,
+    /// Index into [`BUILTIN_COMMANDS`].
+    Builtin { index: usize },
     /// Index into [`App::plugins`].
     Plugin { index: usize },
 }
@@ -85,7 +93,7 @@ impl App {
 
         for (i, candidate) in self.slash_candidates.iter().enumerate() {
             let (name, desc) = match candidate {
-                SlashCandidate::Builtin => ("exit", "quit the application"),
+                SlashCandidate::Builtin { index } => BUILTIN_COMMANDS[*index],
                 SlashCandidate::Plugin { index } => {
                     let cmd = &self.plugins[*index];
                     (cmd.name(), cmd.description())
@@ -112,9 +120,15 @@ impl App {
         if let Some(partial) = self.input.strip_prefix('/') {
             self.slash_candidates.clear();
 
-            // Built-in "/exit" always checked first.
-            if "exit".starts_with(partial) {
-                self.slash_candidates.push(SlashCandidate::Builtin);
+            // Built-ins are always checked first.
+            for (i, (name, _)) in BUILTIN_COMMANDS.iter().enumerate() {
+                if self.slash_candidates.len() >= MAX_CANDIDATES {
+                    break;
+                }
+                if name.starts_with(partial) {
+                    self.slash_candidates
+                        .push(SlashCandidate::Builtin { index: i });
+                }
             }
 
             // Plugin commands.
@@ -144,7 +158,7 @@ impl App {
         let action = {
             let candidate = &self.slash_candidates[self.slash_selected];
             match candidate {
-                SlashCandidate::Builtin => None,
+                SlashCandidate::Builtin { .. } => None,
                 SlashCandidate::Plugin { index } => Some(*index),
             }
         };
@@ -163,7 +177,7 @@ impl App {
     /// Returns the command name of the currently selected slash candidate.
     pub(crate) fn selected_candidate_name(&self) -> &'static str {
         match &self.slash_candidates[self.slash_selected] {
-            SlashCandidate::Builtin => "exit",
+            SlashCandidate::Builtin { index } => BUILTIN_COMMANDS[*index].0,
             SlashCandidate::Plugin { index } => self.plugins[*index].name(),
         }
     }
@@ -172,11 +186,10 @@ impl App {
         &mut self,
         cmd: &str,
     ) {
-        match cmd {
-            "exit" => self.quit(),
-            unknown => {
-                self.add_message(format!("unknown command: /{unknown}"));
-            },
+        if BUILTIN_COMMANDS.iter().any(|(name, _)| *name == cmd) {
+            self.quit();
+        } else {
+            self.add_message(format!("unknown command: /{cmd}"));
         }
     }
 }

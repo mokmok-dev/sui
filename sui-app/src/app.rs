@@ -73,8 +73,8 @@ impl App {
 
     /// Register a pluggable slash command.
     ///
-    /// Built-in `/exit` is always available. Commands registered here appear
-    /// alongside it in the suggestion panel.
+    /// Built-in `/exit` and `/quit` are always available. Commands registered
+    /// here appear alongside them in the suggestion panel.
     pub fn register_command(
         &mut self,
         cmd: impl SlashCommand + 'static,

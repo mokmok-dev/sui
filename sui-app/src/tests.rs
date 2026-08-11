@@ -168,6 +168,15 @@ fn slash_exit_quits() {
 }
 
 #[test]
+fn slash_quit_quits() {
+    let mut app = App::new();
+    type_and_enter(&mut app, "/quit");
+    assert!(app.should_quit);
+    assert!(app.input.is_empty());
+    assert!(app.messages.is_empty());
+}
+
+#[test]
 fn slash_unknown_shows_error() {
     let mut app = App::new();
     type_and_enter(&mut app, "/foo");
@@ -197,7 +206,7 @@ fn bare_slash_has_candidate_and_enter_executes_it() {
     // "/" alone shows all commands as candidates; Enter runs the first one.
     let mut app = App::new();
     type_and_enter(&mut app, "/");
-    assert!(app.should_quit); // exit is the first (and only) candidate
+    assert!(app.should_quit); // exit is the first candidate
     assert!(app.messages.is_empty());
 }
 
@@ -205,7 +214,7 @@ fn bare_slash_has_candidate_and_enter_executes_it() {
 fn slash_candidates_populated_after_typing_slash() {
     let mut app = App::new();
     app.handle_key(key_char('/'));
-    assert_eq!(app.slash_candidates.len(), 1); // "exit" matches ""
+    assert_eq!(app.slash_candidates.len(), 2); // exit + quit match ""
 
     app.handle_key(key_char('e'));
     assert_eq!(app.slash_candidates.len(), 1); // "exit" starts with "e"
@@ -218,18 +227,38 @@ fn slash_candidates_populated_after_typing_slash() {
 }
 
 #[test]
-fn tab_cycles_through_candidates_and_wraps() {
-    // For this test we need multiple commands, so we test with a single
-    // command first, then verify the wrap-around behavior.
+fn slash_candidates_match_quit_prefix() {
     let mut app = App::new();
-    // Type "/" to populate candidates
     app.handle_key(key_char('/'));
-    // With 1 candidate, cycling stays at 0 and wraps to 0
+    app.handle_key(key_char('q'));
+    assert_eq!(app.slash_candidates.len(), 1); // "quit" starts with "q"
+}
+
+#[test]
+fn down_up_cycle_candidates_and_wrap() {
+    let mut app = App::new();
+    // Type "/" to populate candidates (exit, quit)
+    app.handle_key(key_char('/'));
     assert_eq!(app.slash_selected, 0);
-    app.handle_key(key(KeyCode::Tab));
+    app.handle_key(key(KeyCode::Down));
+    assert_eq!(app.slash_selected, 1);
+    app.handle_key(key(KeyCode::Down));
     assert_eq!(app.slash_selected, 0);
 
+    app.handle_key(key(KeyCode::Up));
+    assert_eq!(app.slash_selected, 1);
     app.handle_key(key(KeyCode::BackTab));
+    assert_eq!(app.slash_selected, 0);
+}
+
+#[test]
+fn tab_on_bare_slash_autocompletes_first_candidate() {
+    let mut app = App::new();
+    app.handle_key(key_char('/'));
+    app.handle_key(key(KeyCode::Tab));
+    // Completes the first candidate; candidates then narrow to that name.
+    assert_eq!(app.input, "/exit");
+    assert_eq!(app.slash_candidates.len(), 1);
     assert_eq!(app.slash_selected, 0);
 }
 
@@ -474,12 +503,14 @@ fn ctrl_k_updates_slash_candidates() {
 fn ctrl_n_p_cycle_candidates() {
     let mut app = App::new();
     app.handle_key(key_char('/'));
-    // With 1 candidate (exit), cycling wraps to 0
+    // With 2 candidates (exit, quit), cycling wraps
     assert_eq!(app.slash_selected, 0);
+    app.handle_key(ctrl_key('n'));
+    assert_eq!(app.slash_selected, 1);
     app.handle_key(ctrl_key('n'));
     assert_eq!(app.slash_selected, 0);
     app.handle_key(ctrl_key('p'));
-    assert_eq!(app.slash_selected, 0);
+    assert_eq!(app.slash_selected, 1);
 }
 
 // ── Tab autocomplete tests ───────────────────────────────────────
@@ -493,6 +524,17 @@ fn tab_autocompletes_to_exit() {
     assert_eq!(app.input, "/e");
     app.handle_key(key(KeyCode::Tab));
     assert_eq!(app.input, "/exit");
+    assert_eq!(app.cursor_position, 5);
+}
+
+#[test]
+fn tab_autocompletes_to_quit() {
+    let mut app = App::new();
+    app.handle_key(key_char('/'));
+    app.handle_key(key_char('q'));
+    assert_eq!(app.input, "/q");
+    app.handle_key(key(KeyCode::Tab));
+    assert_eq!(app.input, "/quit");
     assert_eq!(app.cursor_position, 5);
 }
 
