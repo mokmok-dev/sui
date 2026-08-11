@@ -15,7 +15,6 @@ use crate::{
         gate_content_hash, optional_result_content_hash, panel_content_hash, result_content_hash,
         scratch_content_hash, wake_content_hash,
     },
-    lease::RunLease,
     schema::validate_args,
     value::{dynamic_to_json, json_to_dynamic},
 };
@@ -56,12 +55,13 @@ pub struct RunOptions {
     pub agent_budget: usize,
     /// Optional durable journal checkpoint updated after every committed effect.
     ///
-    /// When set, the engine acquires an exclusive run lease on the path and
-    /// `fsync`s each checkpoint before acknowledging the commit (output gate).
+    /// When set, each checkpoint is `fsync`ed (file + parent directory) before
+    /// the commit is acknowledged — the local output gate.
     pub checkpoint: Option<PathBuf>,
-    /// Wall-clock observation (ms since epoch) used to consume `await_wake`
-    /// entries. Required when resuming past an armed wake that is not yet due
-    /// only if the caller wants the wake to fire; arming itself does not.
+    /// Wall-clock observation (ms since epoch) for `await_wake`.
+    ///
+    /// A wake stays paused until this value is `Some(now)` with `now >= due_ms`.
+    /// Omitting it on resume leaves the workflow paused at the armed wake.
     pub now_ms: Option<i64>,
 }
 
@@ -179,13 +179,6 @@ where
             .map(json_to_dynamic)
             .transpose()?
             .unwrap_or(Dynamic::UNIT);
-        // Hold the lease for the entire run so concurrent processes cannot
-        // interleave checkpoint writes on the same durable identity.
-        let _lease = options
-            .checkpoint
-            .as_ref()
-            .map(|path| RunLease::acquire(path))
-            .transpose()?;
         let runtime = Rc::new(RefCell::new(Runtime::new(
             Rc::clone(&self.host),
             options.journal,
@@ -211,6 +204,7 @@ where
             return Err(WorkflowError::AmbiguousHost {
                 invocation: failure.invocation,
                 message: failure.message.clone(),
+                journal: runtime.journal.clone(),
             });
         }
         if !journal_cursor_consistent(&runtime) {
@@ -796,6 +790,7 @@ where
         WorkflowError::AmbiguousHost {
             invocation,
             message,
+            journal: self.journal.clone(),
         }
     }
 

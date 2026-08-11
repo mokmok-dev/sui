@@ -11,7 +11,7 @@ use crate::host::{Capability, HostFailureKind};
 /// [`HostFailureKind::Ambiguous`] may already have. The default constructor
 /// is ambiguous (fail-closed).
 #[derive(Debug, Error)]
-#[error("{message}")]
+#[error("{kind}: {message}")]
 pub struct HostError {
     message: String,
     kind: HostFailureKind,
@@ -88,20 +88,19 @@ pub enum WorkflowError {
     #[error("journal replay diverged: {0}")]
     JournalDivergence(String),
     /// A host call failed ambiguously; auto-retry would risk double-apply.
+    ///
+    /// The attached [`Journal`] already records the ambiguous mark
+    /// (`AgentAmbiguous` or `ParallelSlot::Ambiguous`). Persist it (or pass it
+    /// to the next run) and call [`Journal::retry_failed`] only after deciding
+    /// that re-invocation is safe.
     #[error("ambiguous host failure at invocation {invocation}: {message}")]
     AmbiguousHost {
         /// Zero-based host-call sequence number that failed.
         invocation: usize,
         /// Host-provided failure detail.
         message: String,
-    },
-    /// Another live process holds the checkpoint run lease.
-    #[error("checkpoint lease held at {path}")]
-    LeaseHeld {
-        /// Lock file path.
-        path: PathBuf,
-        /// PID recorded by the holder, when parseable.
-        holder_pid: Option<u32>,
+        /// Journal including the durable ambiguous mark.
+        journal: crate::Journal,
     },
     /// A JSON value could not be represented by Rhai or vice versa.
     #[error("unsupported workflow value: {0}")]

@@ -10,16 +10,14 @@
 //! continuing with mismatched state.
 //!
 //! Durability follows the celld output-gate contract: a checkpointed commit is
-//! not acknowledged until the journal is `fsync`ed, host failures are
-//! classified as retryable or ambiguous, and checkpointed runs take an
-//! exclusive single-writer lease.
+//! not acknowledged until the journal is `fsync`ed, and host failures are
+//! classified as retryable or ambiguous so auto-retry cannot double-apply.
 
 mod engine;
 mod error;
 mod hash;
 mod host;
 mod journal;
-mod lease;
 mod meta;
 mod schema;
 mod value;
@@ -31,7 +29,6 @@ pub use host::{
     AgentOptions, AgentRequest, AgentResult, Capability, EchoHost, Host, HostFailureKind,
 };
 pub use journal::{Journal, JournalEntry, ParallelSlot};
-pub use lease::RunLease;
 pub use meta::{MetaPhase, WorkflowMeta};
 pub use schema::{tool_descriptor, validate_args};
 

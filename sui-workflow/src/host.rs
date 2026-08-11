@@ -22,6 +22,18 @@ pub enum HostFailureKind {
     Ambiguous,
 }
 
+impl std::fmt::Display for HostFailureKind {
+    fn fmt(
+        &self,
+        formatter: &mut std::fmt::Formatter<'_>,
+    ) -> std::fmt::Result {
+        match self {
+            Self::Retryable => formatter.write_str("retryable"),
+            Self::Ambiguous => formatter.write_str("ambiguous"),
+        }
+    }
+}
+
 /// A host capability level requested by an agent invocation.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Capability {
@@ -134,6 +146,15 @@ pub struct AgentResult {
 /// not call back into [`crate::Engine::run`] while a run is in progress
 /// (`RefCell` borrow), and async work should be completed via blocking inside
 /// [`Host::run_agent`].
+///
+/// # Failure classification
+///
+/// Return [`HostError::retryable`] only when the effect definitely did not
+/// start (never connected, rejected before dispatch). Return
+/// [`HostError::ambiguous`] (or [`HostError::new`]) when the effect may have
+/// started — for example a timeout after bytes were written. Ambiguous
+/// failures are journaled and block auto-retry until
+/// [`crate::Journal::retry_failed`] is called deliberately.
 pub trait Host {
     /// Returns the maximum capability this host grants to agent requests.
     fn granted_capability(&self) -> Capability {
@@ -145,7 +166,8 @@ pub trait Host {
     /// # Errors
     ///
     /// Returns [`HostError`] when the host infrastructure cannot execute the
-    /// request.
+    /// request. Prefer [`HostError::retryable`] / [`HostError::ambiguous`]
+    /// over the default constructor when the outcome class is known.
     fn run_agent(
         &self,
         request: &AgentRequest,
