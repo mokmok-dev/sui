@@ -2,22 +2,56 @@ use std::{io, path::PathBuf};
 
 use thiserror::Error;
 
-use crate::host::Capability;
+use crate::host::{Capability, HostFailureKind};
 
 /// An infrastructure failure reported by a workflow host.
+///
+/// Failures are classified like celld peer-dispatch outcomes: a
+/// [`HostFailureKind::Retryable`] miss never reached the effect, while
+/// [`HostFailureKind::Ambiguous`] may already have. The default constructor
+/// is ambiguous (fail-closed).
 #[derive(Debug, Error)]
 #[error("{message}")]
 pub struct HostError {
     message: String,
+    kind: HostFailureKind,
 }
 
 impl HostError {
-    /// Creates a host infrastructure error.
+    /// Creates an ambiguous host failure (may have started the effect).
     #[must_use]
     pub fn new(message: impl Into<String>) -> Self {
+        Self::ambiguous(message)
+    }
+
+    /// Creates a retryable failure: the host never started the effect.
+    #[must_use]
+    pub fn retryable(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            kind: HostFailureKind::Retryable,
         }
+    }
+
+    /// Creates an ambiguous failure: the host may have started the effect.
+    #[must_use]
+    pub fn ambiguous(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            kind: HostFailureKind::Ambiguous,
+        }
+    }
+
+    /// Returns the failure classification.
+    #[must_use]
+    pub const fn kind(&self) -> HostFailureKind {
+        self.kind
+    }
+
+    /// Returns the human-readable message.
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.message
     }
 }
 
@@ -53,6 +87,22 @@ pub enum WorkflowError {
     /// The supplied journal does not match the current execution checksums.
     #[error("journal replay diverged: {0}")]
     JournalDivergence(String),
+    /// A host call failed ambiguously; auto-retry would risk double-apply.
+    #[error("ambiguous host failure at invocation {invocation}: {message}")]
+    AmbiguousHost {
+        /// Zero-based host-call sequence number that failed.
+        invocation: usize,
+        /// Host-provided failure detail.
+        message: String,
+    },
+    /// Another live process holds the checkpoint run lease.
+    #[error("checkpoint lease held at {path}")]
+    LeaseHeld {
+        /// Lock file path.
+        path: PathBuf,
+        /// PID recorded by the holder, when parseable.
+        holder_pid: Option<u32>,
+    },
     /// A JSON value could not be represented by Rhai or vice versa.
     #[error("unsupported workflow value: {0}")]
     Value(String),

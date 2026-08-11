@@ -1,8 +1,8 @@
 use serde_json::json;
 
 use crate::{
-    Capability, EchoHost, Engine, Host, Journal, JournalEntry, RunOptions, WorkflowError,
-    run_with_host,
+    Capability, EchoHost, Engine, Host, HostError, HostFailureKind, Journal, JournalEntry,
+    ParallelSlot, RunOptions, WorkflowError, run_with_host,
 };
 
 const DEMO: &str = r#"
@@ -352,4 +352,301 @@ complete(#{ id: fingerprint("abc") });
         }))
     );
     Ok(())
+}
+
+#[test]
+fn await_wake_arms_then_fires_when_due() -> Result<(), WorkflowError> {
+    let script = r#"
+let meta = #{
+    name: "wake",
+    description: "durable wake gate"
+};
+await_wake("retry", 1000);
+complete(#{ done: true });
+"#;
+    let first = run_with_host(
+        EchoHost,
+        script,
+        RunOptions {
+            now_ms: Some(500),
+            ..RunOptions::default()
+        },
+    )?;
+    assert!(first.complete.is_none());
+    assert_eq!(
+        first.paused.as_ref().map(|pause| pause.kind.as_str()),
+        Some("retry")
+    );
+    assert!(matches!(
+        first.journal.entries(),
+        [JournalEntry::AwaitWake { due_ms: 1000, .. }]
+    ));
+
+    let still_waiting = run_with_host(
+        EchoHost,
+        script,
+        RunOptions {
+            journal: first.journal.clone(),
+            now_ms: Some(999),
+            ..RunOptions::default()
+        },
+    )?;
+    assert!(still_waiting.complete.is_none());
+    assert!(still_waiting.paused.is_some());
+
+    let fired = run_with_host(
+        EchoHost,
+        script,
+        RunOptions {
+            journal: first.journal,
+            now_ms: Some(1000),
+            ..RunOptions::default()
+        },
+    )?;
+    assert_eq!(fired.complete, Some(json!({ "done": true })));
+    assert!(fired.paused.is_none());
+    Ok(())
+}
+
+#[test]
+fn ambiguous_serial_host_failure_blocks_auto_retry() -> Result<(), WorkflowError> {
+    use std::{
+        cell::Cell,
+        rc::Rc,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    struct CountingHost {
+        calls: Rc<Cell<usize>>,
+        ambiguous_first: bool,
+    }
+
+    impl Host for CountingHost {
+        fn granted_capability(&self) -> Capability {
+            Capability::All
+        }
+
+        fn run_agent(
+            &self,
+            request: &crate::AgentRequest,
+        ) -> Result<crate::AgentResult, HostError> {
+            let calls = self.calls.get();
+            self.calls.set(calls + 1);
+            if self.ambiguous_first && calls == 0 {
+                return Err(HostError::ambiguous("maybe started"));
+            }
+            EchoHost.run_agent(request)
+        }
+    }
+
+    let script = r#"
+let meta = #{
+    name: "amb",
+    description: "ambiguous host"
+};
+agent("do it");
+complete(#{ ok: true });
+"#;
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    let path = std::env::temp_dir().join(format!(
+        "sui-workflow-amb-{}-{}.json",
+        std::process::id(),
+        stamp
+    ));
+
+    let calls = Rc::new(Cell::new(0));
+    let error = Engine::new(CountingHost {
+        calls: Rc::clone(&calls),
+        ambiguous_first: true,
+    })
+    .run_script(
+        script,
+        RunOptions {
+            checkpoint: Some(path.clone()),
+            ..RunOptions::default()
+        },
+    )
+    .expect_err("ambiguous must surface");
+    assert!(matches!(error, WorkflowError::AmbiguousHost { .. }));
+    assert_eq!(calls.get(), 1);
+
+    let on_disk =
+        std::fs::read_to_string(&path).map_err(|error| WorkflowError::io(&path, error))?;
+    let mut journal = Journal::from_json(&on_disk)?;
+    assert!(matches!(
+        journal.entries(),
+        [JournalEntry::AgentAmbiguous { .. }]
+    ));
+
+    let resume_calls = Rc::new(Cell::new(0));
+    let blocked = Engine::new(CountingHost {
+        calls: Rc::clone(&resume_calls),
+        ambiguous_first: false,
+    })
+    .run_script(
+        script,
+        RunOptions {
+            journal: journal.clone(),
+            checkpoint: Some(path.clone()),
+            ..RunOptions::default()
+        },
+    )
+    .expect_err("ambiguous journal must block");
+    assert!(matches!(blocked, WorkflowError::AmbiguousHost { .. }));
+    assert_eq!(resume_calls.get(), 0);
+
+    assert_eq!(journal.retry_failed(), 1);
+    assert!(journal.entries().is_empty());
+
+    let recovered_calls = Rc::new(Cell::new(0));
+    let recovered = Engine::new(CountingHost {
+        calls: Rc::clone(&recovered_calls),
+        ambiguous_first: false,
+    })
+    .run_script(
+        script,
+        RunOptions {
+            journal,
+            checkpoint: Some(path.clone()),
+            ..RunOptions::default()
+        },
+    )?;
+    assert_eq!(recovered.complete, Some(json!({ "ok": true })));
+    assert_eq!(recovered_calls.get(), 1);
+
+    let _ = std::fs::remove_file(&path);
+    Ok(())
+}
+
+#[test]
+fn ambiguous_parallel_slot_is_not_soft_failure() -> Result<(), WorkflowError> {
+    struct AmbiguousHost;
+
+    impl Host for AmbiguousHost {
+        fn granted_capability(&self) -> Capability {
+            Capability::All
+        }
+
+        fn run_agent(
+            &self,
+            _request: &crate::AgentRequest,
+        ) -> Result<crate::AgentResult, HostError> {
+            Err(HostError::ambiguous("wire timeout after send"))
+        }
+    }
+
+    let script = r#"
+let meta = #{
+    name: "panel",
+    description: "ambiguous panel"
+};
+parallel([#{ prompt: "a" }, #{ prompt: "b" }]);
+complete(#{ ok: true });
+"#;
+    let path = {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos());
+        std::env::temp_dir().join(format!(
+            "sui-workflow-panel-amb-{}-{}.json",
+            std::process::id(),
+            stamp
+        ))
+    };
+
+    let error = Engine::new(AmbiguousHost)
+        .run_script(
+            script,
+            RunOptions {
+                checkpoint: Some(path.clone()),
+                ..RunOptions::default()
+            },
+        )
+        .expect_err("ambiguous panel slot must not soft-fail");
+    assert!(matches!(error, WorkflowError::AmbiguousHost { .. }));
+
+    let on_disk =
+        std::fs::read_to_string(&path).map_err(|error| WorkflowError::io(&path, error))?;
+    let journal = Journal::from_json(&on_disk)?;
+    let JournalEntry::Parallel { slots, .. } = &journal.entries()[0] else {
+        return Err(WorkflowError::InvalidConfig(
+            "expected parallel journal entry".into(),
+        ));
+    };
+    assert!(matches!(slots[0], ParallelSlot::Ambiguous { .. }));
+    assert!(matches!(slots[1], ParallelSlot::Pending));
+
+    let _ = std::fs::remove_file(&path);
+    Ok(())
+}
+
+#[test]
+fn retryable_parallel_slot_soft_fails() -> Result<(), WorkflowError> {
+    struct RetryableHost;
+
+    impl Host for RetryableHost {
+        fn granted_capability(&self) -> Capability {
+            Capability::All
+        }
+
+        fn run_agent(
+            &self,
+            _request: &crate::AgentRequest,
+        ) -> Result<crate::AgentResult, HostError> {
+            Err(HostError::retryable("never connected"))
+        }
+    }
+
+    let script = r#"
+let meta = #{
+    name: "panel",
+    description: "retryable panel"
+};
+parallel([#{ prompt: "a" }]);
+complete(#{ ok: true });
+"#;
+    let result = Engine::new(RetryableHost).run_script(script, RunOptions::default())?;
+    assert_eq!(result.complete, Some(json!({ "ok": true })));
+    let JournalEntry::Parallel { slots, .. } = &result.journal.entries()[0] else {
+        return Err(WorkflowError::InvalidConfig(
+            "expected parallel journal entry".into(),
+        ));
+    };
+    assert!(matches!(
+        slots[0],
+        ParallelSlot::Completed { result: None, .. }
+    ));
+    Ok(())
+}
+
+#[test]
+fn checkpoint_lease_rejects_second_holder() -> Result<(), WorkflowError> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    let path = std::env::temp_dir().join(format!(
+        "sui-workflow-lease-{}-{}.json",
+        std::process::id(),
+        stamp
+    ));
+
+    let first = crate::RunLease::acquire(&path)?;
+    let second = crate::RunLease::acquire(&path);
+    assert!(matches!(second, Err(WorkflowError::LeaseHeld { .. })));
+    drop(first);
+    let reacquired = crate::RunLease::acquire(&path)?;
+    drop(reacquired);
+    let _ = std::fs::remove_file(&path);
+    Ok(())
+}
+
+#[test]
+fn host_error_defaults_to_ambiguous() {
+    assert_eq!(HostError::new("x").kind(), HostFailureKind::Ambiguous);
+    assert_eq!(HostError::retryable("x").kind(), HostFailureKind::Retryable);
 }

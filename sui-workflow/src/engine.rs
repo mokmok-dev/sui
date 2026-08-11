@@ -8,13 +8,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    AgentOptions, AgentRequest, AgentResult, Capability, Host, Journal, JournalEntry, ParallelSlot,
-    WorkflowError,
+    AgentOptions, AgentRequest, AgentResult, Capability, Host, HostFailureKind, Journal,
+    JournalEntry, ParallelSlot, WorkflowError,
     hash::{self, ContentHash},
     journal::{
         gate_content_hash, optional_result_content_hash, panel_content_hash, result_content_hash,
-        scratch_content_hash,
+        scratch_content_hash, wake_content_hash,
     },
+    lease::RunLease,
     schema::validate_args,
     value::{dynamic_to_json, json_to_dynamic},
 };
@@ -54,7 +55,14 @@ pub struct RunOptions {
     /// Maximum number of agent slots admitted by this run.
     pub agent_budget: usize,
     /// Optional durable journal checkpoint updated after every committed effect.
+    ///
+    /// When set, the engine acquires an exclusive run lease on the path and
+    /// `fsync`s each checkpoint before acknowledging the commit (output gate).
     pub checkpoint: Option<PathBuf>,
+    /// Wall-clock observation (ms since epoch) used to consume `await_wake`
+    /// entries. Required when resuming past an armed wake that is not yet due
+    /// only if the caller wants the wake to fire; arming itself does not.
+    pub now_ms: Option<i64>,
 }
 
 impl Default for RunOptions {
@@ -64,6 +72,7 @@ impl Default for RunOptions {
             journal: Journal::new(),
             agent_budget: DEFAULT_AGENT_BUDGET,
             checkpoint: None,
+            now_ms: None,
         }
     }
 }
@@ -170,11 +179,19 @@ where
             .map(json_to_dynamic)
             .transpose()?
             .unwrap_or(Dynamic::UNIT);
+        // Hold the lease for the entire run so concurrent processes cannot
+        // interleave checkpoint writes on the same durable identity.
+        let _lease = options
+            .checkpoint
+            .as_ref()
+            .map(|path| RunLease::acquire(path))
+            .transpose()?;
         let runtime = Rc::new(RefCell::new(Runtime::new(
             Rc::clone(&self.host),
             options.journal,
             options.agent_budget,
             options.checkpoint,
+            options.now_ms,
         )));
         let mut engine = RhaiEngine::new();
         configure_rhai_limits(&mut engine);
@@ -190,7 +207,13 @@ where
         if let Some(failure) = &runtime.capability_failure {
             return Err(failure.to_error());
         }
-        if runtime.cursor != runtime.journal.entries().len() {
+        if let Some(failure) = &runtime.ambiguous_failure {
+            return Err(WorkflowError::AmbiguousHost {
+                invocation: failure.invocation,
+                message: failure.message.clone(),
+            });
+        }
+        if !journal_cursor_consistent(&runtime) {
             return Err(WorkflowError::JournalDivergence(format!(
                 "execution consumed {} of {} committed entries",
                 runtime.cursor,
@@ -251,6 +274,11 @@ impl CapabilityFailure {
     }
 }
 
+struct AmbiguousFailure {
+    invocation: usize,
+    message: String,
+}
+
 struct Runtime<H> {
     host: Rc<H>,
     journal: Journal,
@@ -259,12 +287,14 @@ struct Runtime<H> {
     spent: usize,
     divergence: Option<String>,
     capability_failure: Option<CapabilityFailure>,
+    ambiguous_failure: Option<AmbiguousFailure>,
     complete: Option<Value>,
     paused: Option<PauseInfo>,
     logs: Vec<String>,
     phases: Vec<String>,
     scratch: BTreeMap<String, String>,
     checkpoint: Option<PathBuf>,
+    now_ms: Option<i64>,
 }
 
 impl<H> Runtime<H>
@@ -276,6 +306,7 @@ where
         journal: Journal,
         budget: usize,
         checkpoint: Option<PathBuf>,
+        now_ms: Option<i64>,
     ) -> Self {
         Self {
             host,
@@ -285,12 +316,14 @@ where
             spent: 0,
             divergence: None,
             capability_failure: None,
+            ambiguous_failure: None,
             complete: None,
             paused: None,
             logs: Vec::new(),
             phases: Vec::new(),
             scratch: BTreeMap::new(),
             checkpoint,
+            now_ms,
         }
     }
 
@@ -320,29 +353,55 @@ where
         let request_hash = request.content_hash()?;
         let invocation = self.cursor;
         if let Some(entry) = self.journal.get(invocation).cloned() {
-            let JournalEntry::Agent {
-                request_hash: recorded_hash,
-                result,
-                ..
-            } = entry
-            else {
-                return Err(self.wrong_entry("agent"));
-            };
-            if recorded_hash != request_hash {
-                return Err(self.diverge(format!(
-                    "agent request_hash at invocation {invocation} changed"
-                )));
+            match entry {
+                JournalEntry::Agent {
+                    request_hash: recorded_hash,
+                    result,
+                    ..
+                } => {
+                    if recorded_hash != request_hash {
+                        return Err(self.diverge(format!(
+                            "agent request_hash at invocation {invocation} changed"
+                        )));
+                    }
+                    self.admit(1)?;
+                    self.cursor += 1;
+                    return Ok(*result);
+                },
+                JournalEntry::AgentAmbiguous {
+                    request_hash: recorded_hash,
+                    message,
+                    ..
+                } => {
+                    if recorded_hash != request_hash {
+                        return Err(self.diverge(format!(
+                            "agent request_hash at invocation {invocation} changed"
+                        )));
+                    }
+                    return Err(self.record_ambiguous(invocation, message));
+                },
+                _ => return Err(self.wrong_entry("agent")),
             }
-            self.admit(1)?;
-            self.cursor += 1;
-            return Ok(*result);
         }
 
         self.admit(1)?;
-        let result = self
-            .host
-            .run_agent(&request)
-            .map_err(|error| WorkflowError::Runtime(format!("host agent failure: {error}")))?;
+        let result = match self.host.run_agent(&request) {
+            Ok(result) => result,
+            Err(error) if error.kind() == HostFailureKind::Ambiguous => {
+                self.journal.push(JournalEntry::AgentAmbiguous {
+                    invocation,
+                    request_hash,
+                    request: Box::new(request),
+                    message: error.message().to_owned(),
+                });
+                if let Err(checkpoint_error) = self.checkpoint() {
+                    self.journal.pop();
+                    return Err(checkpoint_error);
+                }
+                return Err(self.map_host_error(invocation, &error));
+            },
+            Err(error) => return Err(self.map_host_error(invocation, &error)),
+        };
         let result_hash = result_content_hash(&result)?;
         self.journal.push(JournalEntry::Agent {
             invocation,
@@ -351,6 +410,8 @@ where
             request: Box::new(request),
             result: Box::new(result.clone()),
         });
+        // Output gate: withhold the commit from the caller until the journal
+        // is durable. A failed gate rolls the in-memory entry back.
         if let Err(error) = self.checkpoint() {
             self.journal.pop();
             return Err(error);
@@ -410,14 +471,22 @@ where
         let mut results = Vec::with_capacity(requests.len());
         for (index, (request, slot)) in requests.iter().zip(slots).enumerate() {
             let result = match slot {
-                ParallelSlot::Pending => {
-                    // Host infrastructure errors become soft failures for one
-                    // panel slot (Completed { result: None }); serial `agent`
-                    // still aborts the run. Callers that need fail-fast panels
-                    // should check for unit results in Rhai.
-                    let result = self.host.run_agent(request).ok();
-                    self.commit_parallel_slot(invocation, index, result.clone())?;
-                    result
+                ParallelSlot::Pending => match self.host.run_agent(request) {
+                    Ok(result) => {
+                        self.commit_parallel_slot(invocation, index, Some(result.clone()))?;
+                        Some(result)
+                    },
+                    Err(error) if error.kind() == HostFailureKind::Retryable => {
+                        self.commit_parallel_slot(invocation, index, None)?;
+                        None
+                    },
+                    Err(error) => {
+                        self.commit_parallel_ambiguous(invocation, index, error.message())?;
+                        return Err(self.map_host_error(invocation, &error));
+                    },
+                },
+                ParallelSlot::Ambiguous { message } => {
+                    return Err(self.record_ambiguous(invocation, message));
                 },
                 ParallelSlot::Completed { result, .. } => result,
             };
@@ -425,6 +494,41 @@ where
         }
         self.cursor += 1;
         Ok(results)
+    }
+
+    fn commit_parallel_ambiguous(
+        &mut self,
+        invocation: usize,
+        index: usize,
+        message: &str,
+    ) -> Result<(), WorkflowError> {
+        let previous = {
+            let Some(JournalEntry::Parallel { slots, .. }) = self.journal.get_mut(invocation)
+            else {
+                return Err(self.diverge(format!(
+                    "parallel entry {invocation} disappeared while committing slot {index}"
+                )));
+            };
+            let Some(slot) = slots.get_mut(index) else {
+                return Err(
+                    self.diverge(format!("parallel entry {invocation} has no slot {index}"))
+                );
+            };
+            let previous = slot.clone();
+            *slot = ParallelSlot::Ambiguous {
+                message: message.to_owned(),
+            };
+            previous
+        };
+        if let Err(error) = self.checkpoint() {
+            if let Some(JournalEntry::Parallel { slots, .. }) = self.journal.get_mut(invocation)
+                && let Some(slot) = slots.get_mut(index)
+            {
+                *slot = previous;
+            }
+            return Err(error);
+        }
+        Ok(())
     }
 
     fn commit_parallel_slot(
@@ -601,10 +705,98 @@ where
         Ok(true)
     }
 
+    /// Arms or consumes a durable wake. Returns `true` when the workflow must pause.
+    fn await_wake(
+        &mut self,
+        kind: String,
+        due_ms: i64,
+    ) -> Result<bool, WorkflowError> {
+        let wake_hash = wake_content_hash(&kind, due_ms)?;
+        let invocation = self.cursor;
+        if let Some(entry) = self.journal.get(invocation).cloned() {
+            let JournalEntry::AwaitWake {
+                wake_hash: recorded_hash,
+                kind: recorded_kind,
+                due_ms: recorded_due,
+                ..
+            } = entry
+            else {
+                return Err(self.wrong_entry("await_wake"));
+            };
+            if recorded_hash != wake_hash || recorded_kind != kind || recorded_due != due_ms {
+                return Err(self.diverge(format!("wake gate at invocation {invocation} changed")));
+            }
+            return Ok(self.consume_or_pause_wake(kind, due_ms));
+        }
+
+        // Put the wake entry before acknowledging the pause (celld arm gate).
+        self.journal.push(JournalEntry::AwaitWake {
+            invocation,
+            wake_hash,
+            kind: kind.clone(),
+            due_ms,
+        });
+        if let Err(error) = self.checkpoint() {
+            self.journal.pop();
+            return Err(error);
+        }
+        Ok(self.consume_or_pause_wake(kind, due_ms))
+    }
+
+    fn consume_or_pause_wake(
+        &mut self,
+        kind: String,
+        due_ms: i64,
+    ) -> bool {
+        if let Some(now) = self.now_ms
+            && now >= due_ms
+        {
+            self.cursor += 1;
+            return false;
+        }
+        let message = self.now_ms.map_or_else(
+            || format!("wake armed until {due_ms}"),
+            |now| format!("wake armed until {due_ms}; now={now}"),
+        );
+        self.paused = Some(PauseInfo { kind, message });
+        true
+    }
+
     fn checkpoint(&self) -> Result<(), WorkflowError> {
         self.checkpoint
             .as_ref()
             .map_or(Ok(()), |path| self.journal.write_atomic(path))
+    }
+
+    fn map_host_error(
+        &mut self,
+        invocation: usize,
+        error: &crate::HostError,
+    ) -> WorkflowError {
+        match error.kind() {
+            HostFailureKind::Retryable => {
+                WorkflowError::Runtime(format!("host agent failure: {error}"))
+            },
+            HostFailureKind::Ambiguous => self.record_ambiguous(invocation, error.message()),
+        }
+    }
+
+    fn record_ambiguous(
+        &mut self,
+        invocation: usize,
+        message: impl Into<String>,
+    ) -> WorkflowError {
+        let message = message.into();
+        if self.ambiguous_failure.is_none() {
+            self.ambiguous_failure = Some(AmbiguousFailure {
+                invocation,
+                message: message.clone(),
+            });
+        }
+        WorkflowError::AmbiguousHost {
+            invocation,
+            message,
+        }
     }
 
     fn check_capability(
@@ -734,6 +926,22 @@ fn register_host_api<H>(
                 .map_err(|error| runtime_error(&error))?
             {
                 Err(terminated("workflow awaiting user"))
+            } else {
+                Ok(Dynamic::UNIT)
+            }
+        },
+    );
+
+    let state = Rc::clone(runtime);
+    engine.register_fn(
+        "await_wake",
+        move |kind: ImmutableString, due_ms: INT| -> Result<Dynamic, Box<EvalAltResult>> {
+            if state
+                .borrow_mut()
+                .await_wake(kind.to_string(), due_ms)
+                .map_err(|error| runtime_error(&error))?
+            {
+                Err(terminated("workflow awaiting wake"))
             } else {
                 Ok(Dynamic::UNIT)
             }
@@ -879,6 +1087,21 @@ fn budget_map<H>(runtime: &Runtime<H>) -> Result<Map, Box<EvalAltResult>> {
         ("reserved".into(), Dynamic::from_int(0)),
         ("remaining".into(), Dynamic::from_int(remaining)),
     ]))
+}
+
+fn journal_cursor_consistent<H>(runtime: &Runtime<H>) -> bool {
+    let len = runtime.journal.entries().len();
+    if runtime.cursor == len {
+        return true;
+    }
+    // An armed wake keeps the cursor on its journal entry until `now_ms`
+    // covers `due_ms`. That is a valid paused state, not divergence.
+    runtime.paused.is_some()
+        && runtime.cursor + 1 == len
+        && matches!(
+            runtime.journal.get(runtime.cursor),
+            Some(JournalEntry::AwaitWake { .. })
+        )
 }
 
 fn configure_rhai_limits(engine: &mut RhaiEngine) {

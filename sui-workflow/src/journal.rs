@@ -24,6 +24,12 @@ pub enum ParallelSlot {
         /// The committed agent result, or `None` for a failed slot.
         result: Option<AgentResult>,
     },
+    /// The host returned an ambiguous failure; auto-retry is forbidden until
+    /// [`Journal::retry_failed`] explicitly clears the slot.
+    Ambiguous {
+        /// Host-provided failure detail.
+        message: String,
+    },
 }
 
 /// One committed host call and its content-hash identity.
@@ -42,6 +48,20 @@ pub enum JournalEntry {
         request: Box<AgentRequest>,
         /// Committed host result.
         result: Box<AgentResult>,
+    },
+    /// A serial agent call that failed ambiguously.
+    ///
+    /// Resume refuses to re-invoke the host until [`Journal::retry_failed`]
+    /// truncates this entry.
+    AgentAmbiguous {
+        /// Zero-based host-call sequence number.
+        invocation: usize,
+        /// Checksum of the canonical request payload.
+        request_hash: ContentHash,
+        /// Original request.
+        request: Box<AgentRequest>,
+        /// Host-provided failure detail.
+        message: String,
     },
     /// A barrier-style parallel panel.
     Parallel {
@@ -87,6 +107,20 @@ pub enum JournalEntry {
         /// Gate message.
         message: String,
     },
+    /// A durable wake/timer armed until `due_ms`.
+    ///
+    /// The entry is written before the pause is acknowledged (output gate). The
+    /// cursor advances only once `RunOptions::now_ms` covers `due_ms`.
+    AwaitWake {
+        /// Zero-based host-call sequence number.
+        invocation: usize,
+        /// Checksum of kind + `due_ms`.
+        wake_hash: ContentHash,
+        /// Wake kind (surfaced in [`crate::PauseInfo::kind`]).
+        kind: String,
+        /// Earliest wall-clock time (ms since epoch) that may consume this wake.
+        due_ms: i64,
+    },
 }
 
 impl JournalEntry {
@@ -95,10 +129,12 @@ impl JournalEntry {
     pub const fn invocation(&self) -> usize {
         match self {
             Self::Agent { invocation, .. }
+            | Self::AgentAmbiguous { invocation, .. }
             | Self::Parallel { invocation, .. }
             | Self::WriteScratch { invocation, .. }
             | Self::ReadScratch { invocation, .. }
-            | Self::AwaitUser { invocation, .. } => *invocation,
+            | Self::AwaitUser { invocation, .. }
+            | Self::AwaitWake { invocation, .. } => *invocation,
         }
     }
 
@@ -127,6 +163,19 @@ impl JournalEntry {
                 result,
                 ..
             } => validate_agent_hashes(expected, request_hash, result_hash, request, result),
+            Self::AgentAmbiguous {
+                request_hash,
+                request,
+                ..
+            } => {
+                let computed = request.content_hash()?;
+                if &computed != request_hash {
+                    return Err(WorkflowError::JournalDivergence(format!(
+                        "agent_ambiguous entry {expected} request_hash does not match request payload"
+                    )));
+                }
+                Ok(())
+            },
             Self::Parallel {
                 panel_hash,
                 requests,
@@ -155,6 +204,20 @@ impl JournalEntry {
                 if &computed != gate_hash {
                     return Err(WorkflowError::JournalDivergence(format!(
                         "await_user entry {expected} gate_hash does not match payload"
+                    )));
+                }
+                Ok(())
+            },
+            Self::AwaitWake {
+                wake_hash,
+                kind,
+                due_ms,
+                ..
+            } => {
+                let computed = wake_content_hash(kind, *due_ms)?;
+                if &computed != wake_hash {
+                    return Err(WorkflowError::JournalDivergence(format!(
+                        "await_wake entry {expected} wake_hash does not match payload"
                     )));
                 }
                 Ok(())
@@ -320,11 +383,17 @@ impl Journal {
                     truncate_to = Some(index);
                     break;
                 },
+                JournalEntry::AgentAmbiguous { .. } => {
+                    reset = 1;
+                    truncate_to = Some(index);
+                    break;
+                },
                 JournalEntry::Parallel { slots, .. } => {
                     for slot in slots {
                         let should_retry = match slot {
                             ParallelSlot::Pending => false,
-                            ParallelSlot::Completed { result: None, .. } => true,
+                            ParallelSlot::Ambiguous { .. }
+                            | ParallelSlot::Completed { result: None, .. } => true,
                             ParallelSlot::Completed {
                                 result: Some(result),
                                 ..
@@ -361,6 +430,10 @@ impl Journal {
 
     /// Atomically writes this journal to a checkpoint path.
     ///
+    /// The temporary file and its parent directory are `fsync`ed before the
+    /// rename is acknowledged, so a successful return means the journal is
+    /// durable (local RPO=0, matching celld's output gate).
+    ///
     /// # Errors
     ///
     /// Returns an I/O or serialization error when the checkpoint cannot be written.
@@ -368,13 +441,22 @@ impl Journal {
         &self,
         path: &Path,
     ) -> Result<(), WorkflowError> {
+        use std::io::Write;
+
         let temporary = checkpoint_temporary_path(path);
-        fs::write(&temporary, self.to_json()?)
-            .map_err(|error| WorkflowError::io(&temporary, error))?;
+        {
+            let mut file = fs::File::create(&temporary)
+                .map_err(|error| WorkflowError::io(&temporary, error))?;
+            file.write_all(self.to_json()?.as_bytes())
+                .map_err(|error| WorkflowError::io(&temporary, error))?;
+            file.sync_all()
+                .map_err(|error| WorkflowError::io(&temporary, error))?;
+        }
         if let Err(error) = fs::rename(&temporary, path) {
             let _ = fs::remove_file(&temporary);
             return Err(WorkflowError::io(path, error));
         }
+        sync_parent_directory(path)?;
         Ok(())
     }
 
@@ -435,6 +517,16 @@ pub fn gate_content_hash(
     crate::hash::hash_json(&serde_json::json!({
         "kind": kind,
         "message": message,
+    }))
+}
+
+pub fn wake_content_hash(
+    kind: &str,
+    due_ms: i64,
+) -> Result<ContentHash, serde_json::Error> {
+    crate::hash::hash_json(&serde_json::json!({
+        "kind": kind,
+        "due_ms": due_ms,
     }))
 }
 
@@ -540,4 +632,19 @@ fn checkpoint_temporary_path(path: &Path) -> PathBuf {
         COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
     PathBuf::from(temporary)
+}
+
+fn sync_parent_directory(path: &Path) -> Result<(), WorkflowError> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+    let dir = fs::File::open(parent).map_err(|error| WorkflowError::io(parent, error))?;
+    dir.sync_all()
+        .map_err(|error| WorkflowError::io(parent, error))?;
+    Ok(())
 }

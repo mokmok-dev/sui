@@ -10,6 +10,18 @@ use crate::{
     hash::{ContentHash, hash_json},
 };
 
+/// Whether a host infrastructure failure is safe to retry.
+///
+/// Mirrors celld's peer-dispatch classification: only failures that never
+/// reached the effect may be retried automatically.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostFailureKind {
+    /// The host never started the effect; retrying cannot double-apply.
+    Retryable,
+    /// The host may have started the effect; auto-retry is forbidden.
+    Ambiguous,
+}
+
 /// A host capability level requested by an agent invocation.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Capability {
@@ -155,10 +167,10 @@ impl Host for EchoHost {
     ) -> Result<AgentResult, HostError> {
         let request_hash = request
             .content_hash()
-            .map_err(|error| HostError::new(error.to_string()))?;
+            .map_err(|error| HostError::retryable(error.to_string()))?;
         let agent_id = format!("echo-{request_hash}");
         let tokens_used = u64::try_from(request.prompt.split_whitespace().count())
-            .map_err(|error| HostError::new(error.to_string()))?;
+            .map_err(|error| HostError::retryable(error.to_string()))?;
 
         Ok(AgentResult {
             agent_id,
