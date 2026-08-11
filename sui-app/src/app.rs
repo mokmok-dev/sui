@@ -10,6 +10,13 @@ use sui_widget::PromptWidget;
 /// Rows occupied by the bordered prompt widget.
 pub const PROMPT_HEIGHT: u16 = 3;
 
+/// Extra inline rows reserved while the slash-suggestion panel is open.
+///
+/// Kept as a `u16` literal (not `MAX_CANDIDATES as u16`) to satisfy pedantic
+/// cast lints; the assert below locks it to [`MAX_CANDIDATES`].
+const SUGGESTION_PANEL_HEIGHT: u16 = 5;
+const _: () = assert!(SUGGESTION_PANEL_HEIGHT as usize == MAX_CANDIDATES);
+
 /// Holds the full application state: prompt input, submitted messages, and the
 /// run-loop flag.
 ///
@@ -19,8 +26,8 @@ pub const PROMPT_HEIGHT: u16 = 3;
 /// use sui_app::App;
 ///
 /// let mut app = App::new();
-/// // Optionally customise the prompt:
-/// let mut app = App::new().with_prompt_prefix("> ");
+/// app.run_inline()?;
+/// # Ok::<(), std::io::Error>(())
 /// ```
 pub struct App {
     pub(crate) input: String,
@@ -116,19 +123,39 @@ impl App {
         self
     }
 
-    /// Inline viewport height for the current UI: prompt plus slash suggestions.
+    /// Inline viewport height for the current UI.
+    ///
+    /// Prompt-only while idle; expands by a fixed suggestion-panel budget when
+    /// any slash candidates are visible (avoids resizing on every keystroke).
     #[must_use]
-    pub fn inline_height(&self) -> u16 {
-        let suggestions =
-            u16::try_from(self.slash_candidates.len().min(MAX_CANDIDATES)).unwrap_or(u16::MAX);
-        PROMPT_HEIGHT.saturating_add(suggestions)
+    pub const fn inline_height(&self) -> u16 {
+        if self.slash_candidates.is_empty() {
+            PROMPT_HEIGHT
+        } else {
+            PROMPT_HEIGHT.saturating_add(SUGGESTION_PANEL_HEIGHT)
+        }
+    }
+
+    /// Initialize an inline terminal, run until quit, then restore the terminal.
+    ///
+    /// This is the preferred entry point: no alternate screen, prompt-only
+    /// viewport, scrollback via [`App::flush_messages`].
+    ///
+    /// # Errors
+    /// Returns an I/O error if terminal setup, the run loop, or restore fails.
+    pub fn run_inline(&mut self) -> std::io::Result<()> {
+        let mut terminal = ratatui::try_init_with_options(TerminalOptions {
+            viewport: Viewport::Inline(PROMPT_HEIGHT),
+        })?;
+        let result = self.run(&mut terminal);
+        ratatui::restore();
+        result
     }
 
     /// Blocking run loop: flush scrollback → sync viewport → draw → read event.
     ///
-    /// Expects a terminal initialized with [`PROMPT_HEIGHT`] via
-    /// [`ratatui::init_with_options`] and [`Viewport::Inline`] so the UI stays
-    /// in the normal screen buffer (Codex-style), not the alternate screen.
+    /// Prefer [`App::run_inline`] unless you already own an inline
+    /// [`ratatui::Viewport`] terminal whose height starts at [`PROMPT_HEIGHT`].
     ///
     /// # Errors
     /// Returns an I/O error if terminal operations or event reading fail.
@@ -210,9 +237,10 @@ impl App {
             u16::try_from(self.slash_candidates.len().min(MAX_CANDIDATES)).unwrap_or(u16::MAX)
         };
 
-        let [prompt_area, suggestions_area] = Layout::vertical([
+        let [prompt_area, suggestions_area, _reserved] = Layout::vertical([
             Constraint::Length(PROMPT_HEIGHT),
             Constraint::Length(suggestions_height),
+            Constraint::Min(0),
         ])
         .areas(area);
 

@@ -564,9 +564,21 @@ fn inline_height_is_prompt_only_by_default() {
 fn inline_height_grows_with_slash_candidates() {
     let mut app = App::new();
     app.handle_key(key_char('/'));
-    // "/" matches exit + quit → 2 suggestion rows
+    // "/" matches exit + quit — panel opens at a fixed budget, not per-row.
     assert_eq!(app.slash_candidates.len(), 2);
-    assert_eq!(app.inline_height(), PROMPT_HEIGHT + 2);
+    let open_height = app.inline_height();
+    assert!(open_height > PROMPT_HEIGHT);
+
+    // Narrowing candidates must not resize on every keystroke.
+    app.handle_key(key_char('e'));
+    assert_eq!(app.slash_candidates.len(), 1);
+    assert_eq!(app.inline_height(), open_height);
+
+    // Leaving slash mode collapses back to the prompt-only height.
+    app.handle_key(key(KeyCode::Backspace));
+    app.handle_key(key(KeyCode::Backspace));
+    assert!(app.slash_candidates.is_empty());
+    assert_eq!(app.inline_height(), PROMPT_HEIGHT);
 }
 
 fn infallible<T>(result: Result<T, core::convert::Infallible>) -> T {
