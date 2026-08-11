@@ -1,5 +1,8 @@
-use super::{App, char_index_to_byte};
+use super::{App, PROMPT_HEIGHT, char_index_to_byte};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::backend::{Backend, TestBackend};
+use ratatui::layout::Position;
+use ratatui::{Terminal, TerminalOptions, Viewport};
 
 #[test]
 fn char_index_to_byte_ascii() {
@@ -546,4 +549,83 @@ fn tab_no_candidates_does_nothing() {
     app.handle_key(key(KeyCode::Tab));
     // No candidates, input unchanged
     assert_eq!(app.input, "hi");
+}
+
+// ── inline viewport tests ────────────────────────────────────────
+
+#[test]
+fn inline_height_is_prompt_only_by_default() {
+    let app = App::new();
+    assert_eq!(app.inline_height(), PROMPT_HEIGHT);
+    assert_eq!(app.viewport_height, PROMPT_HEIGHT);
+}
+
+#[test]
+fn inline_height_grows_with_slash_candidates() {
+    let mut app = App::new();
+    app.handle_key(key_char('/'));
+    // "/" matches exit + quit → 2 suggestion rows
+    assert_eq!(app.slash_candidates.len(), 2);
+    assert_eq!(app.inline_height(), PROMPT_HEIGHT + 2);
+}
+
+fn infallible<T>(result: Result<T, core::convert::Infallible>) -> T {
+    match result {
+        Ok(value) => value,
+        Err(never) => match never {},
+    }
+}
+
+fn inline_test_terminal(
+    width: u16,
+    height: u16,
+    cursor_y: u16,
+) -> Terminal<TestBackend> {
+    let mut backend = TestBackend::new(width, height);
+    infallible(backend.set_cursor_position(Position::new(0, cursor_y)));
+    infallible(Terminal::with_options(
+        backend,
+        TerminalOptions {
+            viewport: Viewport::Inline(PROMPT_HEIGHT),
+        },
+    ))
+}
+
+#[test]
+fn flush_messages_writes_above_inline_viewport() {
+    let mut terminal = inline_test_terminal(40, 10, 4);
+
+    let mut app = App::new().with_prompt_prefix("> ");
+    app.add_message("hello");
+    app.add_message("world");
+    infallible(app.flush_messages(&mut terminal));
+
+    assert_eq!(app.flushed_messages, 2);
+    // Messages were inserted above the viewport; viewport shifts down by 2.
+    assert_eq!(terminal.get_frame().area().y, 6);
+
+    let row = |backend: &TestBackend, y: u16| -> String {
+        let area = backend.buffer().area;
+        (0..area.width)
+            .map(|x| backend.buffer()[(x, y)].symbol().to_string())
+            .collect::<String>()
+            .trim_end()
+            .to_string()
+    };
+    let backend = terminal.backend();
+    assert_eq!(row(backend, 4), "> hello");
+    assert_eq!(row(backend, 5), "> world");
+}
+
+#[test]
+fn flush_messages_is_idempotent() {
+    let mut terminal = inline_test_terminal(20, 8, 1);
+
+    let mut app = App::new();
+    app.add_message("once");
+    infallible(app.flush_messages(&mut terminal));
+    let y_after_first = terminal.get_frame().area().y;
+    infallible(app.flush_messages(&mut terminal));
+    assert_eq!(terminal.get_frame().area().y, y_after_first);
+    assert_eq!(app.flushed_messages, 1);
 }

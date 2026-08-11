@@ -2,12 +2,16 @@
 //!
 //! Provides [`App`], which owns the prompt state, message history, and the
 //! terminal run-loop (event → update → render).
+//!
+//! The interactive UI uses an inline [`ratatui::Viewport`] so only the prompt
+//! (and slash suggestions) occupy the screen; submitted output is inserted
+//! above it and scrolls into the terminal scrollback.
 
 pub mod app;
 pub mod input;
 pub mod slash;
 
-pub use app::App;
+pub use app::{App, PROMPT_HEIGHT};
 pub use slash::SlashCommand;
 
 /// Converts a char-based index into a byte offset within `s`.
