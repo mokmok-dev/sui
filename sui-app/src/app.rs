@@ -157,9 +157,22 @@ impl App {
     /// Prefer [`App::run_inline`] unless you already own an inline
     /// [`ratatui::Viewport`] terminal whose height starts at [`PROMPT_HEIGHT`].
     ///
+    /// On exit the inline viewport is cleared and the cursor is moved to its
+    /// origin so the shell prompt does not overlap leftover TUI cells.
+    ///
     /// # Errors
     /// Returns an I/O error if terminal operations or event reading fail.
     pub fn run(
+        &mut self,
+        terminal: &mut DefaultTerminal,
+    ) -> std::io::Result<()> {
+        let result = self.event_loop(terminal);
+        // Always tear down so Esc/`/exit` leave a clean normal-screen cursor.
+        let _ = Self::teardown_inline(terminal);
+        result
+    }
+
+    fn event_loop(
         &mut self,
         terminal: &mut DefaultTerminal,
     ) -> std::io::Result<()> {
@@ -169,6 +182,20 @@ impl App {
             terminal.draw(|frame| self.render(frame))?;
             self.handle_event(&crossterm::event::read()?);
         }
+        Ok(())
+    }
+
+    /// Clears the inline viewport and parks the cursor at its top-left origin.
+    ///
+    /// [`Terminal::clear`] restores the previous cursor position afterward, so
+    /// callers must move back to the viewport origin explicitly (same pattern
+    /// as Atuin’s inline-search teardown).
+    pub(crate) fn teardown_inline<B: Backend>(
+        terminal: &mut Terminal<B>,
+    ) -> Result<(), B::Error> {
+        let origin = terminal.get_frame().area().as_position();
+        terminal.clear()?;
+        terminal.set_cursor_position(origin)?;
         Ok(())
     }
 

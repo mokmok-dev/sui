@@ -641,3 +641,34 @@ fn flush_messages_is_idempotent() {
     assert_eq!(terminal.get_frame().area().y, y_after_first);
     assert_eq!(app.flushed_messages, 1);
 }
+
+#[test]
+fn teardown_inline_clears_viewport_and_resets_cursor() {
+    let mut terminal = inline_test_terminal(20, 10, 4);
+    let viewport = terminal.get_frame().area();
+    assert_eq!(viewport.y, 4);
+    assert_eq!(viewport.height, PROMPT_HEIGHT);
+
+    // Draw something into the viewport so we can tell clear worked.
+    infallible(terminal.draw(|frame| {
+        frame.render_widget(ratatui::widgets::Paragraph::new("leftover"), frame.area());
+        frame.set_cursor_position(Position::new(frame.area().x + 3, frame.area().y + 1));
+    }));
+
+    infallible(App::teardown_inline(&mut terminal));
+
+    let origin = Position::new(viewport.x, viewport.y);
+    assert_eq!(infallible(terminal.get_cursor_position()), origin);
+
+    // Cells in the former viewport should be empty after clear.
+    let backend = terminal.backend();
+    for y in viewport.top()..viewport.bottom() {
+        for x in viewport.left()..viewport.right() {
+            assert_eq!(
+                backend.buffer()[(x, y)].symbol(),
+                " ",
+                "expected empty cell at ({x},{y})"
+            );
+        }
+    }
+}
