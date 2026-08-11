@@ -190,9 +190,7 @@ impl App {
     /// [`Terminal::clear`] restores the previous cursor position afterward, so
     /// callers must move back to the viewport origin explicitly (same pattern
     /// as Atuin’s inline-search teardown).
-    pub(crate) fn teardown_inline<B: Backend>(
-        terminal: &mut Terminal<B>,
-    ) -> Result<(), B::Error> {
+    pub(crate) fn teardown_inline<B: Backend>(terminal: &mut Terminal<B>) -> Result<(), B::Error> {
         let origin = terminal.get_frame().area().as_position();
         terminal.clear()?;
         terminal.set_cursor_position(origin)?;
