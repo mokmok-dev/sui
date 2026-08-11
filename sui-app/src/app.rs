@@ -1,3 +1,4 @@
+use crate::slash::{MAX_CANDIDATES, SlashCandidate};
 use ratatui::{
     DefaultTerminal, Frame,
     layout::{Constraint, Direction, Layout},
@@ -27,6 +28,10 @@ pub struct App {
     pub(crate) prompt_prefix: String,
     /// History of submitted prompt texts shown in the main content area.
     pub(crate) messages: Vec<String>,
+    /// Candidates that match the current slash partial input.
+    pub(crate) slash_candidates: Vec<SlashCandidate>,
+    /// Currently highlighted index within `slash_candidates`.
+    pub(crate) slash_selected: usize,
 }
 
 impl Default for App {
@@ -45,7 +50,22 @@ impl App {
             should_quit: false,
             prompt_prefix: "❯ ".to_string(),
             messages: Vec::new(),
+            slash_candidates: Vec::new(),
+            slash_selected: 0,
         }
+    }
+
+    /// Request application shutdown.
+    pub const fn quit(&mut self) {
+        self.should_quit = true;
+    }
+
+    /// Append a message to the message history.
+    pub fn add_message(
+        &mut self,
+        msg: impl Into<String>,
+    ) {
+        self.messages.push(msg.into());
     }
 
     /// Sets the prompt prefix.
@@ -88,9 +108,19 @@ impl App {
     ) {
         let area = frame.area();
 
+        let suggestions_height = if self.slash_candidates.is_empty() {
+            0
+        } else {
+            u16::try_from(self.slash_candidates.len().min(MAX_CANDIDATES)).unwrap_or(u16::MAX)
+        };
+
         let layout = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(1), Constraint::Length(3)])
+            .constraints([
+                Constraint::Min(1),
+                Constraint::Length(3),
+                Constraint::Length(suggestions_height),
+            ])
             .split(area);
 
         // ---- main content area ----
@@ -119,5 +149,10 @@ impl App {
         let cursor_pos = prompt.screen_cursor(layout[1]);
         frame.render_widget(prompt, layout[1]);
         frame.set_cursor_position((cursor_pos.0, cursor_pos.1));
+
+        // ---- slash-suggestions area ----
+        if !self.slash_candidates.is_empty() {
+            self.render_slash_suggestions(frame, layout[2]);
+        }
     }
 }

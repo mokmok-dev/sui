@@ -11,6 +11,25 @@ impl App {
         }
     }
 
+    pub(crate) fn handle_enter(&mut self) {
+        if self.input.is_empty() {
+            return;
+        }
+
+        if !self.slash_candidates.is_empty() {
+            self.execute_selected_slash_command();
+        } else if self.input.starts_with('/') {
+            let cmd = self.input[1..].to_owned();
+            self.handle_slash_command(&cmd);
+        } else {
+            self.messages.push(self.input.clone());
+        }
+        self.input.clear();
+        self.cursor_position = 0;
+        self.slash_candidates.clear();
+        self.slash_selected = 0;
+    }
+
     pub(crate) fn handle_key(
         &mut self,
         key: KeyEvent,
@@ -20,13 +39,7 @@ impl App {
                 self.should_quit = true;
             },
             KeyCode::Esc => self.should_quit = true,
-            KeyCode::Enter => {
-                if !self.input.is_empty() {
-                    self.messages.push(self.input.clone());
-                    self.input.clear();
-                    self.cursor_position = 0;
-                }
-            },
+            KeyCode::Enter => self.handle_enter(),
             KeyCode::Backspace => {
                 if self.cursor_position > 0 {
                     let new_pos = self.cursor_position.saturating_sub(1);
@@ -35,6 +48,7 @@ impl App {
                         self.cursor_position = new_pos;
                     }
                 }
+                self.update_slash_candidates();
             },
             KeyCode::Delete => {
                 if self.cursor_position < self.input.chars().count()
@@ -42,6 +56,7 @@ impl App {
                 {
                     self.input.remove(byte_idx);
                 }
+                self.update_slash_candidates();
             },
             KeyCode::Left => {
                 if self.cursor_position > 0 {
@@ -60,6 +75,22 @@ impl App {
                     .unwrap_or(self.input.len());
                 self.input.insert(byte_pos, c);
                 self.cursor_position = self.cursor_position.saturating_add(1);
+                self.update_slash_candidates();
+            },
+            KeyCode::Tab if !self.slash_candidates.is_empty() => {
+                let name = self.selected_candidate_name();
+                self.input = format!("/{name}");
+                self.cursor_position = self.input.chars().count();
+                self.slash_selected = (self.slash_selected + 1) % self.slash_candidates.len();
+                self.update_slash_candidates();
+            },
+            KeyCode::Down if !self.slash_candidates.is_empty() => {
+                let len = self.slash_candidates.len();
+                self.slash_selected = (self.slash_selected + 1) % len;
+            },
+            KeyCode::BackTab | KeyCode::Up if !self.slash_candidates.is_empty() => {
+                let len = self.slash_candidates.len();
+                self.slash_selected = (self.slash_selected + len - 1) % len;
             },
             _ => {},
         }
