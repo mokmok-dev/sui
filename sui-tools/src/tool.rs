@@ -579,10 +579,7 @@ mod tests {
         registry.register(tool);
 
         let _ = registry
-            .call(
-                "bash",
-                json!({ "command": "sleep 30", "drain": false }),
-            )
+            .call("bash", json!({ "command": "sleep 30", "drain": false }))
             .await?;
         tokio::time::sleep(Duration::from_millis(50)).await;
         let killed = registry.call("bash", json!({ "action": "kill" })).await?;
@@ -651,14 +648,10 @@ mod tests {
         let mut registry = ToolRegistry::new();
         registry.register(tool);
 
-        let missing = registry
-            .call("bash", json!({ "action": "write" }))
-            .await;
+        let missing = registry.call("bash", json!({ "action": "write" })).await;
         assert!(matches!(missing, Err(ToolsError::InvalidArgs(_))));
 
-        let unknown = registry
-            .call("bash", json!({ "action": "nope" }))
-            .await;
+        let unknown = registry.call("bash", json!({ "action": "nope" })).await;
         assert!(matches!(unknown, Err(ToolsError::InvalidArgs(_))));
     }
 

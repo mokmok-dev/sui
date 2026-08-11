@@ -612,10 +612,16 @@ mod tests {
             .map_err(|source| ToolsError::io(dir.0.join("src/huge.rs"), source))?;
 
         // Extension would match (`local` / `staging`); name policy must still skip.
-        fs::write(dir.0.join(".env.local"), "fn zz_envlocal_unique_marker() {}")
-            .map_err(|source| ToolsError::io(dir.0.join(".env.local"), source))?;
-        fs::write(dir.0.join(".env.staging"), "fn zz_envstaging_unique_marker() {}")
-            .map_err(|source| ToolsError::io(dir.0.join(".env.staging"), source))?;
+        fs::write(
+            dir.0.join(".env.local"),
+            "fn zz_envlocal_unique_marker() {}",
+        )
+        .map_err(|source| ToolsError::io(dir.0.join(".env.local"), source))?;
+        fs::write(
+            dir.0.join(".env.staging"),
+            "fn zz_envstaging_unique_marker() {}",
+        )
+        .map_err(|source| ToolsError::io(dir.0.join(".env.staging"), source))?;
 
         let index = Bm25Index::index_tree(&dir.0, &["rs", "local", "staging"])?;
         assert_eq!(index.search("keep_token_xyz", 5).len(), 1);

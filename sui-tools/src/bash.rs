@@ -636,10 +636,7 @@ mod tests {
         let err = session.write_line("echo\0oops").await.expect_err("nul");
         assert!(matches!(err, ToolsError::InvalidArgs(_)));
 
-        let err = session
-            .write_line("echo a\recho b")
-            .await
-            .expect_err("cr");
+        let err = session.write_line("echo a\recho b").await.expect_err("cr");
         assert!(matches!(err, ToolsError::InvalidArgs(_)));
     }
 
@@ -721,9 +718,7 @@ mod tests {
     #[tokio::test]
     async fn wait_with_background_job_does_not_hang() -> Result<(), ToolsError> {
         let mut session = BashSession::spawn(None)?;
-        session
-            .write_line("sleep 30 & echo BG_OK; exit")
-            .await?;
+        session.write_line("sleep 30 & echo BG_OK; exit").await?;
         let outcome = timeout(Duration::from_secs(3), session.wait())
             .await
             .map_err(|_| ToolsError::Bash("wait hung on background job".into()))??;
