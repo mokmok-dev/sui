@@ -23,6 +23,15 @@
 
   outputs =
     inputs:
+    let
+      version =
+        let
+          d = inputs.self.lastModifiedDate;
+          date = "${builtins.substring 0 4 d}.${builtins.substring 4 2 d}.${builtins.substring 6 2 d}";
+          rev = inputs.self.shortRev or inputs.self.dirtyShortRev or "dirty";
+        in
+        "v${date}-${rev}";
+    in
     inputs.flake-parts.lib.mkFlake { inherit inputs; } {
       systems = [
         "aarch64-darwin"
@@ -68,6 +77,8 @@
             ];
           };
 
+          packages.default = self'.packages.sui;
+
           pre-commit.settings = {
             hooks = {
               actionlint.enable = true;
@@ -83,6 +94,9 @@
 
           rust-project = {
             toolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
+            crates.sui.crane.extraBuildArgs = {
+              inherit version;
+            };
           };
 
           treefmt = {
