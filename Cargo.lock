@@ -1557,7 +1557,9 @@ version = "0.0.0"
 dependencies = [
  "crossterm",
  "ratatui",
+ "sui-tools",
  "sui-widget",
+ "tokio",
 ]
 
 [[package]]

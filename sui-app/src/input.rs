@@ -21,6 +21,9 @@ impl App {
         } else if self.input.starts_with('/') {
             let cmd = self.input[1..].to_owned();
             self.handle_slash_command(&cmd);
+        } else if self.input.starts_with('!') {
+            let command = self.input[1..].to_owned();
+            self.handle_bang_command(&command);
         } else {
             self.messages.push(self.input.clone());
         }
@@ -28,6 +31,32 @@ impl App {
         self.cursor_position = 0;
         self.slash_candidates.clear();
         self.slash_selected = 0;
+    }
+
+    /// Executes a bang (`!`) shell escape via [`crate::bang`].
+    ///
+    /// Blocks the event loop until the command finishes or hits the default
+    /// timeout ([`sui_tools::DEFAULT_RUN_TIMEOUT`]). Long-running commands will
+    /// freeze the TUI until they exit or are killed by that deadline.
+    pub(crate) fn handle_bang_command(
+        &mut self,
+        command: &str,
+    ) {
+        let command = command.trim();
+        if command.is_empty() {
+            self.add_message("!");
+            self.add_message("usage: ! <command>");
+            return;
+        }
+        self.add_message(format!("! {command}"));
+        match crate::bang::run_blocking(command) {
+            Ok(output) => {
+                for line in crate::bang::format_output(&output) {
+                    self.add_message(line);
+                }
+            },
+            Err(error) => self.add_message(format!("bash error: {error}")),
+        }
     }
 
     #[allow(clippy::too_many_lines)]

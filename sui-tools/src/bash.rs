@@ -15,6 +15,12 @@
 //! Interactive programs that require a TTY (e.g. password prompts, full-screen TUI)
 //! will misbehave.
 //!
+//! # One-shot vs session
+//!
+//! Prefer [`run_line`] for a single command that should run to completion (e.g. TUI
+//! bang `! cmd`). Use [`BashSession`] / [`crate::BashTool`] when the caller needs a
+//! persistent shell across multiple writes.
+//!
 //! # Runtime
 //!
 //! [`BashSession::spawn`] starts Tokio tasks to read stdout/stderr. It must be
@@ -490,6 +496,73 @@ impl Drop for BashSession {
     }
 }
 
+/// Captured result of [`run_line`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use]
+pub struct CommandOutput {
+    /// stdout bytes decoded lossily as UTF-8.
+    pub stdout: String,
+    /// stderr bytes decoded lossily as UTF-8.
+    pub stderr: String,
+    /// Exit code when available (`None` if killed by signal or still unknown).
+    pub code: Option<i32>,
+    /// True when the wait deadline elapsed and the session was killed.
+    pub timed_out: bool,
+    /// True when a stream hit [`MAX_BUFFER_BYTES`] and further bytes were dropped.
+    pub truncated: bool,
+}
+
+/// Default wall-clock budget for [`run_line`] when callers omit an explicit timeout.
+pub const DEFAULT_RUN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Runs a single shell command to completion in a fresh bash session.
+///
+/// Spawns [`BashSession`], writes `command` as one line, closes stdin (EOF),
+/// waits up to `timeout`, then drains buffered output. Intended for bang-style
+/// (`! cmd`) one-shots — not a substitute for a long-lived [`BashSession`].
+///
+/// `command` must be a single line (no NUL, CR, or LF).
+///
+/// # Errors
+///
+/// Returns [`ToolsError::InvalidArgs`] when `command` contains NUL/CR/LF,
+/// otherwise any spawn / I/O / wait error.
+///
+/// # Examples
+///
+/// ```
+/// use std::time::Duration;
+/// use sui_tools::run_line;
+///
+/// # let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+/// # runtime.block_on(async {
+/// let out = run_line("echo hi", None, Duration::from_secs(3))
+///     .await
+///     .expect("run");
+/// assert!(out.stdout.contains("hi"));
+/// assert_eq!(out.code, Some(0));
+/// # });
+/// ```
+pub async fn run_line(
+    command: &str,
+    cwd: Option<&std::path::Path>,
+    timeout: Duration,
+) -> Result<CommandOutput, ToolsError> {
+    validate_single_line(command)?;
+    let mut session = BashSession::spawn(cwd)?;
+    session.write_line(command).await?;
+    session.close_stdin().await?;
+    let outcome = session.wait_timeout(timeout).await?;
+    let drained = session.drain().await?;
+    Ok(CommandOutput {
+        stdout: String::from_utf8_lossy(&drained.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&drained.stderr).into_owned(),
+        code: outcome.code,
+        timed_out: outcome.timed_out,
+        truncated: drained.truncated,
+    })
+}
+
 /// Rejects strings that would become multi-line or NUL-terminated shell input.
 pub(crate) fn validate_single_line(line: &str) -> Result<(), ToolsError> {
     if line.as_bytes().contains(&0) {
@@ -768,5 +841,41 @@ mod tests {
             validate_single_line("echo a\rb"),
             Err(ToolsError::InvalidArgs(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn run_line_echo() -> Result<(), ToolsError> {
+        let out = run_line("echo run-line-ok", None, Duration::from_secs(3)).await?;
+        assert!(!out.timed_out);
+        assert_eq!(out.code, Some(0));
+        assert!(
+            out.stdout.contains("run-line-ok"),
+            "stdout={:?}",
+            out.stdout
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_line_captures_stderr_and_nonzero() -> Result<(), ToolsError> {
+        let out = run_line("echo err-line 1>&2; exit 3", None, Duration::from_secs(3)).await?;
+        assert_eq!(out.code, Some(3));
+        assert!(out.stderr.contains("err-line"), "stderr={:?}", out.stderr);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_line_timeout() -> Result<(), ToolsError> {
+        let out = run_line("sleep 30", None, Duration::from_millis(100)).await?;
+        assert!(out.timed_out);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_line_rejects_newline() {
+        let err = run_line("echo a\necho b", None, Duration::from_secs(1))
+            .await
+            .expect_err("newline");
+        assert!(matches!(err, ToolsError::InvalidArgs(_)));
     }
 }

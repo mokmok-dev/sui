@@ -196,6 +196,46 @@ fn normal_text_still_adds_to_messages() {
 }
 
 #[test]
+fn bang_echo_adds_command_and_stdout() {
+    let mut app = App::new();
+    type_and_enter(&mut app, "! echo bang-app-ok");
+    assert!(app.input.is_empty());
+    assert!(
+        app.messages.iter().any(|m| m == "! echo bang-app-ok"),
+        "messages={:?}",
+        app.messages
+    );
+    assert!(
+        app.messages
+            .iter()
+            .any(|m| m.contains("bang-app-ok") && m != "! echo bang-app-ok"),
+        "expected stdout line, messages={:?}",
+        app.messages
+    );
+}
+
+#[test]
+fn bang_empty_shows_usage() {
+    let mut app = App::new();
+    type_and_enter(&mut app, "!");
+    assert_eq!(
+        app.messages,
+        vec!["!".to_owned(), "usage: ! <command>".to_owned()]
+    );
+}
+
+#[test]
+fn bang_nonzero_exit_is_reported() {
+    let mut app = App::new();
+    type_and_enter(&mut app, "! exit 9");
+    assert!(
+        app.messages.iter().any(|m| m == "exit 9"),
+        "messages={:?}",
+        app.messages
+    );
+}
+
+#[test]
 fn empty_enter_does_nothing_with_slash() {
     // Already tested but making sure /-prefix doesn't interfere with empty handling
     let mut app = App::new();

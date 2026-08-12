@@ -6,8 +6,13 @@
 //! The interactive UI uses an inline [`ratatui::Viewport`] so only the prompt
 //! (and slash suggestions) occupy the screen; submitted output is inserted
 //! above it and scrolls into the terminal scrollback.
+//!
+//! Input prefixes:
+//! - `/` — slash commands (`/exit`, `/quit`, plugins)
+//! - `!` — one-shot bash via [`sui_tools::run_line`] (e.g. `! echo foo`)
 
 pub mod app;
+pub(crate) mod bang;
 pub mod input;
 pub mod slash;
 
