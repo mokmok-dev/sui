@@ -981,7 +981,6 @@ async fn prompt_with_llm_appends_assistant_reply_and_history() {
                 .insert_header("content-type", "text/event-stream")
                 .set_body_string(sse),
         )
-        .expect(1)
         .mount(&server)
         .await;
 
