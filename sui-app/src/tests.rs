@@ -1003,6 +1003,55 @@ async fn prompt_with_llm_appends_assistant_reply_and_history() {
 }
 
 #[tokio::test]
+async fn prompt_with_tools_runs_agent_loop() {
+    use serde_json::json;
+    use sui_llm::{LlmClient, LlmConfig};
+    use sui_tools::ToolRegistry;
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path},
+    };
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "chatcmpl-1",
+            "object": "chat.completion",
+            "created": 1,
+            "model": "proxy-model",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "agent-ok"
+                },
+                "finish_reason": "stop"
+            }]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let config = LlmConfig::new(server.uri(), "test-key", "proxy-model").expect("config");
+    let mut app = App::new()
+        .with_llm(LlmClient::new(&config))
+        .with_tools(ToolRegistry::new());
+    type_and_enter(&mut app, "hi");
+
+    assert!(
+        message_texts(&app).contains(&"agent-ok"),
+        "messages={:?}",
+        message_texts(&app)
+    );
+    assert!(
+        app.chat_history.iter().any(|msg| msg.content == "agent-ok"),
+        "history={:?}",
+        app.chat_history
+    );
+}
+
+#[tokio::test]
 async fn prompt_llm_error_pops_failed_user_turn() {
     use serde_json::json;
     use sui_llm::{LlmClient, LlmConfig};

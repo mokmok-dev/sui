@@ -69,9 +69,18 @@ impl App {
             return;
         };
 
-        self.chat_history
-            .push(sui_llm::ChatMessage::user(prompt.to_owned()));
-        let rx = crate::llm::chat_stream_spawn(&client, &self.chat_history);
+        let rx = if let Some(tools) = self.tools.clone() {
+            if self.chat_history.is_empty() {
+                let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+                self.chat_history
+                    .push(sui_llm::ChatMessage::system(sui_agent::system_prompt(&cwd)));
+            }
+            crate::llm::agent_spawn(&client, tools, &self.chat_history, prompt)
+        } else {
+            let mut outgoing = self.chat_history.clone();
+            outgoing.push(sui_llm::ChatMessage::user(prompt.to_owned()));
+            crate::llm::chat_stream_spawn(&client, &outgoing)
+        };
         self.pending_llm = Some(PendingLlm::new(rx));
     }
 

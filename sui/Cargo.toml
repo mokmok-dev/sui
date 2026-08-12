@@ -9,6 +9,7 @@ color-eyre = { workspace = true }
 ratatui = { workspace = true, features = ["crossterm", "scrolling-regions"] }
 sui-app = { workspace = true }
 sui-llm = { workspace = true }
+sui-tools = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 

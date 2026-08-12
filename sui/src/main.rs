@@ -1,5 +1,6 @@
 use sui_app::App;
 use sui_llm::LlmClient;
+use sui_tools::{Bm25Index, coding_registry};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -16,7 +17,16 @@ async fn main() -> Result<(), MainError> {
 
     let mut app = App::new();
     match LlmClient::from_env() {
-        Ok(client) => app = app.with_llm(client),
+        Ok(client) => {
+            let cwd = std::env::current_dir().ok();
+            let index = cwd
+                .as_ref()
+                .and_then(|path| Bm25Index::index_tree(path, &["rs", "toml", "md", "rhai"]).ok())
+                .unwrap_or_default();
+            app = app
+                .with_llm(client)
+                .with_tools(coding_registry(index, cwd.as_deref()));
+        },
         Err(error) => {
             // Shell / slash still work; prompt chat reports this on submit.
             eprintln!("sui: LLM not configured ({error})");
