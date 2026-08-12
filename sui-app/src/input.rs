@@ -46,9 +46,9 @@ impl App {
     /// Queues a user turn to the configured LLM.
     ///
     /// Returns immediately after spawning the worker; the event loop polls
-    /// [`crate::App::poll_pending_llm`] and animates a working spinner until
-    /// the reply arrives (or [`crate::llm::DEFAULT_CHAT_TIMEOUT`] fires).
-    /// Streaming is intentionally out of scope for this sync TUI path.
+    /// [`crate::App::poll_pending_llm`] and renders Markdown deltas above the
+    /// prompt until the stream completes (or [`crate::llm::DEFAULT_CHAT_TIMEOUT`]
+    /// fires).
     pub(crate) fn handle_chat_prompt(
         &mut self,
         prompt: &str,
@@ -63,7 +63,7 @@ impl App {
 
         self.chat_history
             .push(sui_llm::ChatMessage::user(prompt.to_owned()));
-        let rx = crate::llm::chat_spawn(&client, &self.chat_history);
+        let rx = crate::llm::chat_stream_spawn(&client, &self.chat_history);
         self.pending_llm = Some(PendingLlm::new(rx));
     }
 
