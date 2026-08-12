@@ -2,7 +2,9 @@
 //!
 //! Provider routing, retries, and upstream keys live in the Proxy. This crate
 //! only talks `OpenAI` chat completions at a configurable `base_url` with a
-//! Proxy-issued `api_key` and a logical `model` name.
+//! Proxy-issued `api_key` and a logical `model` name. Tool calling uses the
+//! same wire format: advertise [`ToolSpec`]s, read [`ChatResponse::tool_calls`],
+//! append [`ChatMessage::tool`] results, sample again.
 //!
 //! # Configuration
 //!
@@ -41,4 +43,4 @@ mod message;
 pub use client::{ChatChunk, ChatResponse, ChatStream, LlmClient};
 pub use config::LlmConfig;
 pub use error::LlmError;
-pub use message::{ChatMessage, Role};
+pub use message::{ChatMessage, Role, ToolCall, ToolSpec};
