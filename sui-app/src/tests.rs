@@ -733,8 +733,15 @@ fn tab_no_candidates_does_nothing() {
 #[test]
 fn inline_height_is_prompt_only_by_default() {
     let app = App::new();
-    assert_eq!(app.inline_height(), PROMPT_HEIGHT);
+    assert_eq!(app.inline_height(80), PROMPT_HEIGHT);
     assert_eq!(app.viewport_height, PROMPT_HEIGHT);
+}
+
+#[test]
+fn inline_height_grows_with_wrapped_input() {
+    let mut app = App::new();
+    app.input = "hello world".into();
+    assert!(app.inline_height(10) > PROMPT_HEIGHT);
 }
 
 #[test]
@@ -743,19 +750,19 @@ fn inline_height_grows_with_slash_candidates() {
     app.handle_key(key_char('/'));
     // "/" matches exit + quit — panel opens at a fixed budget, not per-row.
     assert_eq!(app.slash_candidates.len(), 2);
-    let open_height = app.inline_height();
+    let open_height = app.inline_height(80);
     assert!(open_height > PROMPT_HEIGHT);
 
     // Narrowing candidates must not resize on every keystroke.
     app.handle_key(key_char('e'));
     assert_eq!(app.slash_candidates.len(), 1);
-    assert_eq!(app.inline_height(), open_height);
+    assert_eq!(app.inline_height(80), open_height);
 
     // Leaving slash mode collapses back to the prompt-only height.
     app.handle_key(key(KeyCode::Backspace));
     app.handle_key(key(KeyCode::Backspace));
     assert!(app.slash_candidates.is_empty());
-    assert_eq!(app.inline_height(), PROMPT_HEIGHT);
+    assert_eq!(app.inline_height(80), PROMPT_HEIGHT);
 }
 
 fn infallible<T>(result: Result<T, core::convert::Infallible>) -> T {
@@ -778,6 +785,29 @@ fn inline_test_terminal(
             viewport: Viewport::Inline(PROMPT_HEIGHT),
         },
     ))
+}
+
+#[test]
+fn flush_reply_wraps_long_line() {
+    let mut terminal = inline_test_terminal(20, 10, 4);
+
+    let mut app = App::new();
+    app.add_reply("Great to see you! What can I help you with today?");
+    infallible(app.flush_messages(&mut terminal));
+
+    let row = |backend: &TestBackend, y: u16| -> String {
+        let area = backend.buffer().area;
+        (0..area.width)
+            .map(|x| backend.buffer()[(x, y)].symbol().to_string())
+            .collect::<String>()
+            .trim_end()
+            .to_string()
+    };
+    let backend = terminal.backend();
+    assert_eq!(row(backend, 4), "Great to see you!");
+    assert_eq!(row(backend, 5), "What can I help you");
+    assert_eq!(row(backend, 6), "with today?");
+    assert_eq!(terminal.get_frame().area().y, 7);
 }
 
 #[test]
