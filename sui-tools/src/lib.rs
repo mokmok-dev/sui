@@ -6,7 +6,10 @@
 //! - [`corpus`]: shared tree-walk / skip policy for lexical indexers
 //! - [`bash`]: async non-blocking bash session primitives (pipes, not a PTY)
 //!   plus [`run_line`] for one-shot commands
-//! - [`tool`]: thin [`Tool`] trait + registry with builtin `code_search` / `bash`
+//! - [`edit`]: `SEARCH` / `REPLACE` block parser + [`tool::EditTool`] applying
+//!   LLM edit blocks to files
+//! - [`tool`]: thin [`Tool`] trait + registry with builtin `code_search` /
+//!   `bash` / `edit`
 //!
 //! # Threat model
 //!
@@ -19,6 +22,7 @@
 pub mod bash;
 pub mod bm25;
 pub mod corpus;
+pub mod edit;
 pub mod error;
 pub mod tantivy_index;
 pub mod tool;
@@ -31,6 +35,7 @@ pub use bm25::{
     Bm25Index, DEFAULT_B, DEFAULT_K1, LexicalSearch, MAX_FILE_BYTES, MAX_INDEX_DOCS, SNIPPET_CHARS,
     SearchHit, tokenize,
 };
+pub use edit::{EditTool, SearchReplaceBlock, apply_blocks, parse_search_replace_blocks};
 pub use error::ToolsError;
 pub use tantivy_index::TantivyIndex;
 pub use tool::{
