@@ -23,6 +23,12 @@ impl App {
                 }
             },
             Mode::Prompt => {
+                // An open @-mention panel takes Enter to accept the file and
+                // keep composing, rather than submitting the prompt.
+                if !self.at_candidates.is_empty() {
+                    self.accept_selected_at();
+                    return;
+                }
                 if self.input.is_empty() {
                     return;
                 }
@@ -41,6 +47,8 @@ impl App {
         self.cursor_position = 0;
         self.slash_candidates.clear();
         self.slash_selected = 0;
+        self.at_candidates.clear();
+        self.at_selected = 0;
     }
 
     /// Queues a user turn to the configured LLM.
@@ -141,7 +149,7 @@ impl App {
                         self.cursor_position = new_pos;
                     }
                 }
-                self.update_slash_candidates();
+                self.refresh_suggestions();
             },
             KeyCode::Delete => {
                 if self.cursor_position < self.input.chars().count()
@@ -149,35 +157,47 @@ impl App {
                 {
                     self.input.remove(byte_idx);
                 }
-                self.update_slash_candidates();
+                self.refresh_suggestions();
             },
             KeyCode::Left => {
                 if self.cursor_position > 0 {
                     self.cursor_position = self.cursor_position.saturating_sub(1);
                 }
+                self.refresh_suggestions();
             },
             KeyCode::Right => {
                 if self.cursor_position < self.input.chars().count() {
                     self.cursor_position = self.cursor_position.saturating_add(1);
                 }
+                self.refresh_suggestions();
             },
-            KeyCode::Home => self.cursor_position = 0,
-            KeyCode::End => self.cursor_position = self.input.chars().count(),
+            KeyCode::Home => {
+                self.cursor_position = 0;
+                self.refresh_suggestions();
+            },
+            KeyCode::End => {
+                self.cursor_position = self.input.chars().count();
+                self.refresh_suggestions();
+            },
             KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.cursor_position = 0;
+                self.refresh_suggestions();
             },
             KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.cursor_position = self.input.chars().count();
+                self.refresh_suggestions();
             },
             KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if self.cursor_position < self.input.chars().count() {
                     self.cursor_position = self.cursor_position.saturating_add(1);
                 }
+                self.refresh_suggestions();
             },
             KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if self.cursor_position > 0 {
                     self.cursor_position = self.cursor_position.saturating_sub(1);
                 }
+                self.refresh_suggestions();
             },
             KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if self.cursor_position > 0 {
@@ -187,7 +207,7 @@ impl App {
                         self.cursor_position = new_pos;
                     }
                 }
-                self.update_slash_candidates();
+                self.refresh_suggestions();
             },
             KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if self.cursor_position < self.input.chars().count()
@@ -195,7 +215,7 @@ impl App {
                 {
                     self.input.remove(byte_idx);
                 }
-                self.update_slash_candidates();
+                self.refresh_suggestions();
             },
             KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if self.cursor_position < self.input.chars().count() {
@@ -203,19 +223,13 @@ impl App {
                         .unwrap_or(self.input.len());
                     self.input.truncate(start_byte);
                 }
-                self.update_slash_candidates();
+                self.refresh_suggestions();
             },
             KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if !self.slash_candidates.is_empty() {
-                    let len = self.slash_candidates.len();
-                    self.slash_selected = (self.slash_selected + 1) % len;
-                }
+                self.cycle_suggestion(true);
             },
             KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if !self.slash_candidates.is_empty() {
-                    let len = self.slash_candidates.len();
-                    self.slash_selected = (self.slash_selected + len - 1) % len;
-                }
+                self.cycle_suggestion(false);
             },
             // Empty prompt + `!` enters one-shot shell mode (Enter/Esc → Prompt).
             KeyCode::Char('!')
@@ -230,22 +244,24 @@ impl App {
                     .unwrap_or(self.input.len());
                 self.input.insert(byte_pos, c);
                 self.cursor_position = self.cursor_position.saturating_add(1);
-                self.update_slash_candidates();
+                self.refresh_suggestions();
+            },
+            // Tab accepts the highlighted @-mention (insert path, keep editing).
+            KeyCode::Tab if !self.at_candidates.is_empty() => {
+                self.accept_selected_at();
             },
             KeyCode::Tab if !self.slash_candidates.is_empty() => {
                 let name = self.selected_candidate_name();
                 self.input = format!("/{name}");
                 self.cursor_position = self.input.chars().count();
                 self.slash_selected = (self.slash_selected + 1) % self.slash_candidates.len();
-                self.update_slash_candidates();
+                self.refresh_suggestions();
             },
-            KeyCode::Down if !self.slash_candidates.is_empty() => {
-                let len = self.slash_candidates.len();
-                self.slash_selected = (self.slash_selected + 1) % len;
+            KeyCode::Down if self.suggestion_count() > 0 => {
+                self.cycle_suggestion(true);
             },
-            KeyCode::BackTab | KeyCode::Up if !self.slash_candidates.is_empty() => {
-                let len = self.slash_candidates.len();
-                self.slash_selected = (self.slash_selected + len - 1) % len;
+            KeyCode::BackTab | KeyCode::Up if self.suggestion_count() > 0 => {
+                self.cycle_suggestion(false);
             },
             _ => {},
         }

@@ -11,10 +11,11 @@
 //!
 //! Interaction uses explicit [`Mode`] state, not input-prefix inference:
 //! - [`Mode::Prompt`] (default) — chat via optional [`sui_llm::LlmClient`];
-//!   `/` opens slash commands. While a chat request is in flight the prompt
-//!   border shows a working spinner, assistant Markdown streams above the
-//!   prompt, and further chat submits are deferred until the stream completes
-//!   (Ctrl-C / Esc still quit).
+//!   `/` opens slash commands and `@` opens a workspace file picker (typing
+//!   `@` anywhere suggests files; Enter/Tab inserts the relative path). While a
+//!   chat request is in flight the prompt border shows a working spinner,
+//!   assistant Markdown streams above the prompt, and further chat submits are
+//!   deferred until the stream completes (Ctrl-C / Esc still quit).
 //! - [`Mode::Shell`] — entered with `!` on an empty prompt; Enter runs bash
 //!   via [`sui_tools::run_line`], then returns to [`Mode::Prompt`]; Esc cancels
 //!   back to Prompt without running; output is flushed as dim ghost text
@@ -31,6 +32,7 @@ pub(crate) mod bang;
 pub mod input;
 pub(crate) mod llm;
 pub(crate) mod markdown;
+pub(crate) mod mention;
 pub mod mode;
 pub mod slash;
 

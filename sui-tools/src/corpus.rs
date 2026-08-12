@@ -128,6 +128,43 @@ pub fn visit_code_files(
     })
 }
 
+/// Lists workspace-relative file paths under `root` for interactive pickers.
+///
+/// Applies the same skip policy as [`visit_code_files`] (skip dirs in the skip
+/// list and dot-dirs, likely-secret files, symlinks) but **without reading file
+/// contents**, and keeps files of every extension.
+///
+/// Paths are relative to `root`, use `/` separators, and are returned sorted.
+/// They are lossy UTF-8 *display* strings (via `to_string_lossy`), so non-UTF-8
+/// names may not round-trip back to a `Path`. At most `limit` paths are
+/// collected (traversal stops once the cap is reached, before the final sort),
+/// so `limit` bounds the walk cost; `limit == 0` returns an empty list.
+///
+/// # Errors
+///
+/// Returns [`ToolsError::Io`] only when `root` itself cannot be read; per-entry
+/// failures are skipped.
+pub fn list_workspace_files(
+    root: &Path,
+    limit: usize,
+) -> Result<Vec<String>, ToolsError> {
+    let mut paths = Vec::new();
+    walk_files(root, &mut |path| {
+        if paths.len() >= limit {
+            return Ok(VisitControl::Stop);
+        }
+        if is_secret_path(path) {
+            return Ok(VisitControl::Continue);
+        }
+        if let Ok(rel) = path.strip_prefix(root) {
+            paths.push(rel.to_string_lossy().replace('\\', "/"));
+        }
+        Ok(VisitControl::Continue)
+    })?;
+    paths.sort();
+    Ok(paths)
+}
+
 fn walk_files(
     root: &Path,
     visit: &mut dyn FnMut(&Path) -> Result<VisitControl, ToolsError>,
@@ -202,6 +239,36 @@ impl Drop for TempDir {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn list_workspace_files_walks_relative_sorted_and_skips_policy() {
+        let dir = temp_dir("list-files");
+        let _guard = TempDir(dir.clone());
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::create_dir_all(dir.join("target")).unwrap();
+        fs::create_dir_all(dir.join(".git")).unwrap();
+        fs::write(dir.join("src/main.rs"), "fn main() {}").unwrap();
+        fs::write(dir.join("README.md"), "# hi").unwrap();
+        fs::write(dir.join(".env"), "SECRET=1").unwrap();
+        fs::write(dir.join("target/artifact.o"), "junk").unwrap();
+        fs::write(dir.join(".git/config"), "junk").unwrap();
+
+        let files = list_workspace_files(&dir, 1000).unwrap();
+        assert_eq!(files, vec!["README.md", "src/main.rs"]);
+    }
+
+    #[test]
+    fn list_workspace_files_respects_limit() {
+        let dir = temp_dir("list-files-limit");
+        let _guard = TempDir(dir.clone());
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("a.txt"), "a").unwrap();
+        fs::write(dir.join("b.txt"), "b").unwrap();
+        fs::write(dir.join("c.txt"), "c").unwrap();
+
+        assert_eq!(list_workspace_files(&dir, 2).unwrap().len(), 2);
+        assert!(list_workspace_files(&dir, 0).unwrap().is_empty());
+    }
 
     #[test]
     fn is_secret_path_matches_env_glob() {

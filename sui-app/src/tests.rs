@@ -1145,3 +1145,160 @@ fn render_japanese_streaming_without_spurious_gaps() {
         "streaming CJK must not have gaps: {row:?}"
     );
 }
+
+// ── @-mention file picker tests ──────────────────────────────────
+
+use crate::mention::{active_at_token, filter_files};
+
+/// Seeds the workspace file cache so `@` tests avoid touching the filesystem.
+fn seed_files(
+    app: &mut App,
+    files: &[&str],
+) {
+    app.file_cache = Some(files.iter().map(|s| (*s).to_owned()).collect());
+}
+
+#[test]
+fn active_at_token_detects_bare_at() {
+    assert_eq!(active_at_token("@", 1), Some((0, String::new())));
+}
+
+#[test]
+fn active_at_token_reads_query_up_to_cursor() {
+    assert_eq!(active_at_token("@src", 4), Some((0, "src".into())));
+    // Cursor mid-token only captures text to its left.
+    assert_eq!(active_at_token("@src", 2), Some((0, "s".into())));
+}
+
+#[test]
+fn active_at_token_works_mid_prompt_after_space() {
+    assert_eq!(
+        active_at_token("explain @main", 13),
+        Some((8, "main".into()))
+    );
+}
+
+#[test]
+fn active_at_token_ignores_email_like_at() {
+    assert_eq!(active_at_token("foo@bar", 7), None);
+}
+
+#[test]
+fn active_at_token_none_after_whitespace() {
+    assert_eq!(active_at_token("@src file", 9), None);
+}
+
+#[test]
+fn filter_files_substring_case_insensitive_and_capped() {
+    let files = vec![
+        "src/app.rs".to_owned(),
+        "src/MAIN.rs".to_owned(),
+        "README.md".to_owned(),
+    ];
+    assert_eq!(filter_files(&files, "main", 5), vec!["src/MAIN.rs"]);
+    // Empty query keeps the first `limit` entries.
+    assert_eq!(filter_files(&files, "", 2).len(), 2);
+}
+
+#[test]
+fn typing_at_opens_file_candidates() {
+    let mut app = App::new();
+    seed_files(&mut app, &["src/main.rs", "src/app.rs", "README.md"]);
+    app.handle_key(key_char('@'));
+    assert_eq!(app.at_candidates.len(), 3);
+    assert!(app.slash_candidates.is_empty());
+
+    type_text(&mut app, "app");
+    assert_eq!(app.at_candidates, vec!["src/app.rs".to_owned()]);
+}
+
+#[test]
+fn tab_accepts_selected_file_mention() {
+    let mut app = App::new();
+    seed_files(&mut app, &["src/app.rs"]);
+    type_text(&mut app, "@app");
+    app.handle_key(key(KeyCode::Tab));
+    assert_eq!(app.input, "src/app.rs ");
+    assert_eq!(app.cursor_position, app.input.chars().count());
+    assert!(app.at_candidates.is_empty());
+}
+
+#[test]
+fn enter_accepts_mention_without_submitting() {
+    let mut app = App::new();
+    seed_files(&mut app, &["src/app.rs"]);
+    type_text(&mut app, "explain @app");
+    app.handle_key(key(KeyCode::Enter));
+    assert_eq!(app.input, "explain src/app.rs ");
+    assert!(
+        app.messages.is_empty(),
+        "Enter must not submit while accepting"
+    );
+}
+
+#[test]
+fn mention_accept_preserves_trailing_text() {
+    let mut app = App::new();
+    seed_files(&mut app, &["src/app.rs"]);
+    type_text(&mut app, "a @app b");
+    // Move cursor to just after "@app" (before " b").
+    app.handle_key(key(KeyCode::Left));
+    app.handle_key(key(KeyCode::Left));
+    app.handle_key(key(KeyCode::Tab));
+    assert_eq!(app.input, "a src/app.rs  b");
+}
+
+#[test]
+fn mention_accept_replaces_whole_token_from_mid_cursor() {
+    let mut app = App::new();
+    seed_files(&mut app, &["src/app.rs"]);
+    type_text(&mut app, "@app");
+    // Cursor between "@a" and "pp"; accepting must still drop the "pp" suffix.
+    app.handle_key(key(KeyCode::Left));
+    app.handle_key(key(KeyCode::Left));
+    assert_eq!(app.cursor_position, 2);
+    app.handle_key(key(KeyCode::Tab));
+    assert_eq!(app.input, "src/app.rs ");
+}
+
+#[test]
+fn at_candidates_cleared_for_slash_input() {
+    let mut app = App::new();
+    seed_files(&mut app, &["src/app.rs"]);
+    // "/" owns the panel: an @ later in a slash line must not open files.
+    type_text(&mut app, "/x @app");
+    assert!(app.at_candidates.is_empty());
+}
+
+#[test]
+fn at_navigation_cycles_file_candidates() {
+    let mut app = App::new();
+    seed_files(&mut app, &["a.rs", "b.rs"]);
+    app.handle_key(key_char('@'));
+    assert_eq!(app.at_selected, 0);
+    app.handle_key(key(KeyCode::Down));
+    assert_eq!(app.at_selected, 1);
+    app.handle_key(key(KeyCode::Down));
+    assert_eq!(app.at_selected, 0);
+    app.handle_key(key(KeyCode::Up));
+    assert_eq!(app.at_selected, 1);
+}
+
+#[test]
+fn at_panel_grows_inline_height() {
+    let mut app = App::new();
+    seed_files(&mut app, &["a.rs"]);
+    app.handle_key(key_char('@'));
+    assert!(app.inline_height(80) > PROMPT_HEIGHT);
+}
+
+#[test]
+fn at_is_literal_in_shell_mode() {
+    let mut app = App::new();
+    seed_files(&mut app, &["a.rs"]);
+    app.handle_key(key_char('!'));
+    type_text(&mut app, "@a");
+    assert_eq!(app.mode(), Mode::Shell);
+    assert!(app.at_candidates.is_empty());
+    assert_eq!(app.input, "@a");
+}
