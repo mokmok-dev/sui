@@ -184,6 +184,8 @@ fn type_and_enter(
 ) {
     type_text(app, text);
     app.handle_key(key(KeyCode::Enter));
+    // LLM chat is async (spinner path); settle so assertions see the reply.
+    app.settle_pending_llm();
 }
 
 /// Enter shell mode (`!` on empty prompt) then type/run a command.
@@ -991,4 +993,66 @@ async fn prompt_llm_error_pops_failed_user_turn() {
         "messages={:?}",
         message_texts(&app)
     );
+}
+
+#[tokio::test]
+async fn prompt_llm_waiting_shows_spinner_and_ignores_input() {
+    use serde_json::json;
+    use std::time::Duration;
+    use sui_llm::{LlmClient, LlmConfig};
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path},
+    };
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_millis(300))
+                .set_body_json(json!({
+                    "id": "chatcmpl-1",
+                    "object": "chat.completion",
+                    "created": 1,
+                    "model": "proxy-model",
+                    "choices": [{
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": "done"
+                        },
+                        "finish_reason": "stop"
+                    }]
+                })),
+        )
+        // Quit abandons before the worker may have hit the server.
+        .mount(&server)
+        .await;
+
+    let config = LlmConfig::new(server.uri(), "test-key", "proxy-model").expect("config");
+    let mut app = App::new().with_llm(LlmClient::new(&config));
+    type_text(&mut app, "hi");
+    app.handle_key(key(KeyCode::Enter));
+
+    assert!(app.pending_llm.is_some());
+    let title = app.prompt_title_for_render();
+    assert!(
+        title.starts_with(" working ") && title.ends_with(' '),
+        "title={title:?}"
+    );
+
+    app.handle_key(key_char('x'));
+    assert!(app.input.is_empty(), "input must be ignored while waiting");
+    assert!(!app.should_quit);
+
+    app.handle_key(ctrl_key('c'));
+    assert!(app.should_quit);
+    assert!(app.pending_llm.is_none());
+    assert!(
+        app.chat_history.is_empty(),
+        "quit mid-request must roll back the user turn"
+    );
+    // Worker may still finish; we abandoned the receiver so no reply is applied.
+    assert_eq!(message_texts(&app), vec!["hi"]);
 }
