@@ -1,3 +1,4 @@
+use crate::mode::Mode;
 use crate::{App, char_index_to_byte};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 
@@ -12,21 +13,25 @@ impl App {
     }
 
     pub(crate) fn handle_enter(&mut self) {
-        if self.input.is_empty() {
-            return;
-        }
-
-        if !self.slash_candidates.is_empty() {
-            self.execute_selected_slash_command();
-        } else if self.input.starts_with('/') {
-            let cmd = self.input[1..].to_owned();
-            self.handle_slash_command(&cmd);
-        } else if self.input.starts_with('!') {
-            let command = self.input[1..].to_owned();
-            self.handle_bang_command(&command);
-        } else {
-            self.messages
-                .push(crate::app::ScrollbackLine::Prompt(self.input.clone()));
+        match self.mode {
+            Mode::Shell => {
+                let command = self.input.clone();
+                self.handle_shell_command(&command);
+            },
+            Mode::Prompt => {
+                if self.input.is_empty() {
+                    return;
+                }
+                if !self.slash_candidates.is_empty() {
+                    self.execute_selected_slash_command();
+                } else if self.input.starts_with('/') {
+                    let cmd = self.input[1..].to_owned();
+                    self.handle_slash_command(&cmd);
+                } else {
+                    self.messages
+                        .push(crate::app::ScrollbackLine::Prompt(self.input.clone()));
+                }
+            },
         }
         self.input.clear();
         self.cursor_position = 0;
@@ -34,19 +39,18 @@ impl App {
         self.slash_selected = 0;
     }
 
-    /// Executes a bang (`!`) shell escape via [`crate::bang`].
+    /// Runs a one-shot shell command via [`crate::bang`].
     ///
     /// Blocks the event loop until the command finishes or hits the default
     /// timeout ([`sui_tools::DEFAULT_RUN_TIMEOUT`]). Long-running commands will
     /// freeze the TUI until they exit or are killed by that deadline.
-    pub(crate) fn handle_bang_command(
+    pub(crate) fn handle_shell_command(
         &mut self,
         command: &str,
     ) {
         let command = command.trim();
         if command.is_empty() {
-            self.add_message("!");
-            self.add_message("usage: ! <command>");
+            self.add_message("usage: <command>");
             return;
         }
         self.add_message(format!("! {command}"));
@@ -69,7 +73,14 @@ impl App {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.should_quit = true;
             },
-            KeyCode::Esc => self.should_quit = true,
+            KeyCode::Esc => {
+                if matches!(self.mode, Mode::Prompt) {
+                    self.should_quit = true;
+                } else {
+                    // Shell (and future modes): leave back to Prompt.
+                    self.set_mode(Mode::Prompt);
+                }
+            },
             KeyCode::Enter => self.handle_enter(),
             KeyCode::Backspace => {
                 if self.cursor_position > 0 {
@@ -154,6 +165,14 @@ impl App {
                     let len = self.slash_candidates.len();
                     self.slash_selected = (self.slash_selected + len - 1) % len;
                 }
+            },
+            // Empty prompt + `!` enters shell mode (sticky), like vim `:` for cmdline.
+            KeyCode::Char('!')
+                if self.mode == Mode::Prompt
+                    && self.input.is_empty()
+                    && !key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                self.set_mode(Mode::Shell);
             },
             KeyCode::Char(c) => {
                 let byte_pos = char_index_to_byte(&self.input, self.cursor_position)
