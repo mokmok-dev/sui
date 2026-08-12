@@ -2652,6 +2652,7 @@ dependencies = [
 name = "sui-tools"
 version = "0.0.0"
 dependencies = [
+ "regex",
  "serde",
  "serde_json",
  "tantivy",

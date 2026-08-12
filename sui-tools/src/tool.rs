@@ -3,9 +3,11 @@
 //! # Threat model
 //!
 //! Builtin tools are **not a sandbox**. [`BashTool`] runs unsandboxed shell
-//! commands with the host credentials (see [`crate::bash`]). [`CodeSearchTool`]
-//! only reads what was already indexed. Callers must gate tool exposure and
-//! isolate the process when untrusted agents can invoke these tools.
+//! commands with the host credentials (see [`crate::bash`]). [`EditTool`]
+//! (see [`crate::edit`]) writes to whatever path the caller passes.
+//! [`CodeSearchTool`] only reads what was already indexed. Callers must gate
+//! tool exposure and isolate the process when untrusted agents can invoke
+//! these tools.
 //!
 //! After a bash session exits it is **not** auto-respawned; callers must create
 //! a new [`BashTool`] / session. Auto-respawn is deferred as out of scope for
@@ -419,7 +421,7 @@ pub fn code_search_registry(index: impl LexicalSearch + 'static) -> ToolRegistry
     registry
 }
 
-/// Builds a registry with `code_search` and `bash` builtins.
+/// Builds a registry with `code_search`, `bash`, and `edit` builtins.
 ///
 /// # Errors
 ///
@@ -431,6 +433,7 @@ pub fn builtin_registry(
 ) -> Result<ToolRegistry, ToolsError> {
     let mut registry = code_search_registry(index);
     registry.register(BashTool::spawn(bash_cwd)?);
+    registry.register(crate::edit::EditTool::new());
     Ok(registry)
 }
 
@@ -519,12 +522,17 @@ mod tests {
         let registry = builtin_registry(Bm25Index::default(), None)?;
         assert_eq!(
             registry.names(),
-            vec!["bash".to_owned(), "code_search".to_owned()]
+            vec![
+                "bash".to_owned(),
+                "code_search".to_owned(),
+                "edit".to_owned()
+            ]
         );
         let descriptors = registry.descriptors();
-        assert_eq!(descriptors.len(), 2);
+        assert_eq!(descriptors.len(), 3);
         assert_eq!(descriptors[0]["name"], "bash");
         assert_eq!(descriptors[1]["name"], "code_search");
+        assert_eq!(descriptors[2]["name"], "edit");
 
         let written = registry
             .call(

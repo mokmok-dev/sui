@@ -26,6 +26,12 @@ pub enum ToolsError {
         #[source]
         source: io::Error,
     },
+    /// A search-and-replace block could not be applied to the target file.
+    #[error("edit error: {0}")]
+    Edit(String),
+    /// The search-and-replace regex failed to compile or misbehaved.
+    #[error("search/replace regex error: {0}")]
+    Regex(String),
     /// JSON parsing or serialization failed.
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
