@@ -331,6 +331,25 @@ fn shell_mode_returns_to_prompt_after_command() {
 }
 
 #[test]
+fn shell_mode_returns_to_prompt_after_bash_error() {
+    let mut app = App::new();
+    // Embedded newline is rejected by validate_single_line before spawn.
+    app.handle_key(key_char('!'));
+    // Insert via handle_key would type chars; inject invalid command directly.
+    app.input = "echo a\necho b".into();
+    app.cursor_position = app.input.chars().count();
+    app.handle_key(key(KeyCode::Enter));
+    assert_eq!(app.mode(), Mode::Prompt);
+    assert!(
+        message_texts(&app)
+            .iter()
+            .any(|m| m.starts_with("bash error:")),
+        "messages={:?}",
+        app.messages
+    );
+}
+
+#[test]
 fn empty_enter_does_nothing_with_slash() {
     // Already tested but making sure /-prefix doesn't interfere with empty handling
     let mut app = App::new();

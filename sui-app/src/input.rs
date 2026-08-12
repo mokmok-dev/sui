@@ -19,7 +19,6 @@ impl App {
                 if self.handle_shell_command(&command) {
                     // One-shot: leave shell once the bash command finishes.
                     self.set_mode(Mode::Prompt);
-                    return;
                 }
             },
             Mode::Prompt => {
