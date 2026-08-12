@@ -945,26 +945,22 @@ async fn prompt_with_llm_appends_assistant_reply_and_history() {
     use sui_llm::{LlmClient, LlmConfig};
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
-        matchers::{method, path},
+        matchers::{body_partial_json, method, path},
     };
 
     let server = MockServer::start().await;
+    let sse = concat!(
+        "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"proxy-model\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\\nworld\"},\"finish_reason\":null}]}\n\n",
+        "data: [DONE]\n\n",
+    );
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "id": "chatcmpl-1",
-            "object": "chat.completion",
-            "created": 1,
-            "model": "proxy-model",
-            "choices": [{
-                "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": "hello\nworld"
-                },
-                "finish_reason": "stop"
-            }]
-        })))
+        .and(body_partial_json(json!({ "stream": true })))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse),
+        )
         .expect(1)
         .mount(&server)
         .await;
@@ -973,14 +969,13 @@ async fn prompt_with_llm_appends_assistant_reply_and_history() {
     let mut app = App::new().with_llm(LlmClient::new(&config));
     type_and_enter(&mut app, "hi");
 
-    assert_eq!(message_texts(&app), vec!["hi", "hello", "world"]);
+    assert_eq!(message_texts(&app), vec!["hi", "hello\nworld"]);
     assert!(
         matches!(
             &app.messages[1..],
-            [ScrollbackLine::Reply(a), ScrollbackLine::Reply(b)]
-                if a == "hello" && b == "world"
+            [ScrollbackLine::Reply(content)] if content == "hello\nworld"
         ),
-        "expected reply lines, messages={:?}",
+        "expected reply markdown, messages={:?}",
         app.messages
     );
     assert_eq!(app.chat_history.len(), 2);
@@ -1032,29 +1027,22 @@ async fn prompt_llm_waiting_shows_spinner_and_ignores_input() {
     use sui_llm::{LlmClient, LlmConfig};
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
-        matchers::{method, path},
+        matchers::{body_partial_json, method, path},
     };
 
     let server = MockServer::start().await;
+    let sse = concat!(
+        "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"proxy-model\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"done\"},\"finish_reason\":null}]}\n\n",
+        "data: [DONE]\n\n",
+    );
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
+        .and(body_partial_json(json!({ "stream": true })))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_delay(Duration::from_millis(300))
-                .set_body_json(json!({
-                    "id": "chatcmpl-1",
-                    "object": "chat.completion",
-                    "created": 1,
-                    "model": "proxy-model",
-                    "choices": [{
-                        "index": 0,
-                        "message": {
-                            "role": "assistant",
-                            "content": "done"
-                        },
-                        "finish_reason": "stop"
-                    }]
-                })),
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse),
         )
         // Quit abandons before the worker may have hit the server.
         .mount(&server)

@@ -5,7 +5,10 @@ name = "sui-app"
 version.workspace = true
 
 [dependencies]
+codewandler-markdown = { workspace = true }
+codewandler-markdown-ratatui = { workspace = true }
 crossterm = { workspace = true }
+futures = { workspace = true }
 ratatui = { workspace = true, features = ["crossterm"] }
 sui-llm = { workspace = true }
 sui-tools = { workspace = true }

@@ -1,3 +1,4 @@
+use crate::markdown::{render_markdown, StreamingMarkdown};
 use crate::mode::Mode;
 use crate::slash::{MAX_CANDIDATES, SlashCandidate, SlashCommand};
 use ratatui::{
@@ -13,14 +14,14 @@ use std::time::Instant;
 use sui_llm::{ChatMessage, ChatResponse, LlmClient};
 use sui_widget::{PROMPT_MIN_HEIGHT, PromptWidget, wrap_prefixed, wrap_text};
 
-/// In-flight LLM chat: worker result channel + spinner clock.
+/// In-flight LLM chat: worker stream channel + spinner clock.
 pub(crate) struct PendingLlm {
-    rx: Receiver<Result<ChatResponse, String>>,
+    rx: Receiver<crate::llm::LlmStreamMsg>,
     started: Instant,
 }
 
 impl PendingLlm {
-    pub(crate) fn new(rx: Receiver<Result<ChatResponse, String>>) -> Self {
+    pub(crate) fn new(rx: Receiver<crate::llm::LlmStreamMsg>) -> Self {
         Self {
             rx,
             started: Instant::now(),
@@ -45,7 +46,7 @@ pub(crate) enum ScrollbackLine {
     Prompt(String),
     /// Dim ghost text (shell stdout/stderr) without the prompt prefix.
     Ghost(String),
-    /// Assistant reply text without the prompt prefix (normal intensity).
+    /// Assistant reply (Markdown source, no prompt prefix).
     Reply(String),
 }
 
@@ -95,6 +96,8 @@ pub struct App {
     pub(crate) chat_history: Vec<ChatMessage>,
     /// Active LLM request (event loop polls; spinner animates until it lands).
     pub(crate) pending_llm: Option<PendingLlm>,
+    /// Incremental Markdown for the in-flight assistant reply.
+    pub(crate) streaming_reply: Option<StreamingMarkdown>,
 }
 
 impl Default for App {
@@ -122,6 +125,7 @@ impl App {
             llm: None,
             chat_history: Vec::new(),
             pending_llm: None,
+            streaming_reply: None,
         }
     }
 
@@ -181,7 +185,7 @@ impl App {
         self.messages.push(ScrollbackLine::Ghost(msg.into()));
     }
 
-    /// Append an assistant reply line (no prompt prefix, normal intensity).
+    /// Append an assistant reply (Markdown source, no prompt prefix).
     pub fn add_reply(
         &mut self,
         msg: impl Into<String>,
@@ -227,20 +231,26 @@ impl App {
 
     /// Inline viewport height for the current UI at the given terminal width.
     ///
-    /// Grows with wrapped prompt input and expands by a fixed suggestion-panel
-    /// budget when any slash candidates are visible (avoids resizing on every
-    /// keystroke).
+    /// Grows with wrapped prompt input, the streaming reply, and expands by a
+    /// fixed suggestion-panel budget when any slash candidates are visible.
     #[must_use]
     pub fn inline_height(
         &self,
         width: u16,
     ) -> u16 {
         let prompt_height = PromptWidget::block_height(&self.input, &self.prompt_prefix, width);
-        if self.slash_candidates.is_empty() {
-            prompt_height
+        let streaming_height = self
+            .streaming_reply
+            .as_ref()
+            .map_or(0, |reply| reply.line_count(width as usize));
+        let suggestions_height = if self.slash_candidates.is_empty() {
+            0
         } else {
-            prompt_height.saturating_add(SUGGESTION_PANEL_HEIGHT)
-        }
+            SUGGESTION_PANEL_HEIGHT
+        };
+        prompt_height
+            .saturating_add(streaming_height)
+            .saturating_add(suggestions_height)
     }
 
     /// Initialize an inline terminal, run until quit, then restore the terminal.
@@ -323,9 +333,7 @@ impl App {
             Ok(response) => {
                 self.chat_history
                     .push(sui_llm::ChatMessage::assistant(response.content.clone()));
-                for line in response.content.lines() {
-                    self.add_reply(line);
-                }
+                self.add_reply(response.content);
             },
             Err(error) => {
                 let _ = self.chat_history.pop();
@@ -334,21 +342,73 @@ impl App {
         }
     }
 
+    fn ensure_streaming_reply(&mut self) -> &mut StreamingMarkdown {
+        self.streaming_reply
+            .get_or_insert_with(StreamingMarkdown::new)
+    }
+
+    fn clear_streaming_reply(&mut self) {
+        self.streaming_reply = None;
+    }
+
+    fn finish_streaming_reply(
+        &mut self,
+        response: ChatResponse,
+    ) {
+        if let Some(mut streaming) = self.streaming_reply.take() {
+            streaming.finish();
+            let content = response.content;
+            self.chat_history
+                .push(sui_llm::ChatMessage::assistant(content.clone()));
+            self.add_reply(content);
+        } else {
+            self.apply_chat_result(Ok(response));
+        }
+    }
+
+    /// Returns `true` when the stream is finished and [`Self::pending_llm`]
+    /// should be cleared.
+    fn handle_stream_msg(
+        &mut self,
+        msg: crate::llm::LlmStreamMsg,
+    ) -> bool {
+        use crate::llm::LlmStreamMsg;
+        match msg {
+            LlmStreamMsg::Chunk(delta) => {
+                self.ensure_streaming_reply().push_delta(&delta);
+                false
+            },
+            LlmStreamMsg::Done(response) => {
+                self.finish_streaming_reply(response);
+                true
+            },
+            LlmStreamMsg::Failed(error) => {
+                self.clear_streaming_reply();
+                let _ = self.chat_history.pop();
+                self.add_message(format!("llm error: {error}"));
+                true
+            },
+        }
+    }
+
     /// Non-blocking check for an in-flight LLM response.
     pub(crate) fn poll_pending_llm(&mut self) {
-        let result = {
+        let msg = {
             let Some(pending) = &self.pending_llm else {
                 return;
             };
             match pending.rx.try_recv() {
-                Ok(result) => Some(result),
+                Ok(msg) => Some(msg),
                 Err(TryRecvError::Empty) => None,
-                Err(TryRecvError::Disconnected) => Some(Err("llm worker disconnected".into())),
+                Err(TryRecvError::Disconnected) => {
+                    Some(crate::llm::LlmStreamMsg::Failed("llm worker disconnected".into()))
+                },
             }
         };
-        if let Some(result) = result {
+        if let Some(msg) = msg
+            && self.handle_stream_msg(msg)
+        {
             self.pending_llm = None;
-            self.apply_chat_result(result);
         }
     }
 
@@ -357,6 +417,7 @@ impl App {
     /// Used when quitting mid-request so [`Self::chat_history`] stays paired.
     pub(crate) fn abandon_pending_llm(&mut self) {
         if self.pending_llm.take().is_some() {
+            self.clear_streaming_reply();
             let _ = self.chat_history.pop();
         }
     }
@@ -364,14 +425,20 @@ impl App {
     /// Blocks until any in-flight LLM request finishes (tests / sync callers).
     #[cfg(test)]
     pub(crate) fn settle_pending_llm(&mut self) {
-        let Some(pending) = self.pending_llm.take() else {
-            return;
-        };
-        let result = pending
-            .rx
-            .recv()
-            .unwrap_or_else(|_| Err("llm worker disconnected".into()));
-        self.apply_chat_result(result);
+        loop {
+            let msg = {
+                let Some(pending) = &self.pending_llm else {
+                    return;
+                };
+                pending.rx.recv().unwrap_or_else(|_| {
+                    crate::llm::LlmStreamMsg::Failed("llm worker disconnected".into())
+                })
+            };
+            if self.handle_stream_msg(msg) {
+                self.pending_llm = None;
+                return;
+            }
+        }
     }
 
     /// Border title: mode title normally, animated working spinner while waiting.
@@ -417,19 +484,19 @@ impl App {
             match line {
                 ScrollbackLine::Prompt(text) => {
                     let rows = wrap_prefixed(text, &self.prompt_prefix, width as usize);
-                    Self::insert_wrapped_rows(terminal, rows, Style::default())?;
+                    Self::insert_wrapped_rows(terminal, &rows, Style::default())?;
                 },
                 ScrollbackLine::Ghost(text) => {
                     let rows = wrap_text(text, width as usize);
                     Self::insert_wrapped_rows(
                         terminal,
-                        rows,
+                        &rows,
                         Style::default().add_modifier(Modifier::DIM),
                     )?;
                 },
                 ScrollbackLine::Reply(text) => {
-                    let rows = wrap_text(text, width as usize);
-                    Self::insert_wrapped_rows(terminal, rows, Style::default())?;
+                    let rendered = render_markdown(text, width as usize);
+                    Self::insert_wrapped_lines(terminal, rendered.lines)?;
                 },
             }
             self.flushed_messages += 1;
@@ -439,13 +506,28 @@ impl App {
 
     fn insert_wrapped_rows<B: Backend>(
         terminal: &mut Terminal<B>,
-        rows: Vec<String>,
+        rows: &[String],
+        style: Style,
+    ) -> Result<(), B::Error> {
+        let lines: Vec<Line<'_>> = rows.iter().map(|row| Line::from(row.as_str())).collect();
+        Self::insert_wrapped_lines_styled(terminal, lines, style)
+    }
+
+    fn insert_wrapped_lines<B: Backend>(
+        terminal: &mut Terminal<B>,
+        rows: Vec<Line<'static>>,
+    ) -> Result<(), B::Error> {
+        Self::insert_wrapped_lines_styled(terminal, rows, Style::default())
+    }
+
+    fn insert_wrapped_lines_styled<B: Backend>(
+        terminal: &mut Terminal<B>,
+        rows: Vec<Line<'_>>,
         style: Style,
     ) -> Result<(), B::Error> {
         let height = u16::try_from(rows.len().max(1)).unwrap_or(u16::MAX);
         terminal.insert_before(height, move |buf| {
-            let lines: Vec<Line<'_>> = rows.iter().map(|row| Line::from(row.as_str())).collect();
-            Paragraph::new(Text::from(lines))
+            Paragraph::new(Text::from(rows))
                 .style(style)
                 .render(buf.area, buf);
         })
@@ -486,21 +568,33 @@ impl App {
         frame: &mut Frame,
     ) {
         let area = frame.area();
+        let width = area.width;
         let prompt_height =
-            PromptWidget::block_height(&self.input, &self.prompt_prefix, area.width);
-
+            PromptWidget::block_height(&self.input, &self.prompt_prefix, width);
+        let streaming_height = self
+            .streaming_reply
+            .as_ref()
+            .map_or(0, |reply| reply.line_count(width as usize));
         let suggestions_height = if self.slash_candidates.is_empty() {
             0
         } else {
             u16::try_from(self.slash_candidates.len().min(MAX_CANDIDATES)).unwrap_or(u16::MAX)
         };
 
-        let [prompt_area, suggestions_area, _reserved] = Layout::vertical([
+        let [streaming_area, prompt_area, suggestions_area, _reserved] = Layout::vertical([
+            Constraint::Length(streaming_height),
             Constraint::Length(prompt_height),
             Constraint::Length(suggestions_height),
             Constraint::Min(0),
         ])
         .areas(area);
+
+        if streaming_height > 0
+            && let Some(streaming) = &self.streaming_reply
+        {
+            let text = Text::from(streaming.render_lines(width as usize));
+            Paragraph::new(text).render(streaming_area, frame.buffer_mut());
+        }
 
         let title = self.prompt_title_for_render();
         let prompt = PromptWidget::new(&self.input, self.cursor_position, &self.prompt_prefix)
