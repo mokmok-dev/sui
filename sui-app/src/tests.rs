@@ -1056,4 +1056,3 @@ async fn prompt_llm_waiting_shows_spinner_and_ignores_input() {
     // Worker may still finish; we abandoned the receiver so no reply is applied.
     assert_eq!(message_texts(&app), vec!["hi"]);
 }
-

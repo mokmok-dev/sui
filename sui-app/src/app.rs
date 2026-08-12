@@ -337,9 +337,7 @@ impl App {
             match pending.rx.try_recv() {
                 Ok(result) => Some(result),
                 Err(TryRecvError::Empty) => None,
-                Err(TryRecvError::Disconnected) => {
-                    Some(Err("llm worker disconnected".into()))
-                },
+                Err(TryRecvError::Disconnected) => Some(Err("llm worker disconnected".into())),
             }
         };
         if let Some(result) = result {
