@@ -1,8 +1,9 @@
 //! Interaction mode — what the prompt is addressing.
 //!
-//! Modes are sticky (vim-like): you enter one, stay until you leave. The border
-//! title and Enter semantics follow the active mode. Add variants here when
-//! subagent / workflow surfaces exist; do not infer mode from input prefixes.
+//! The border title and Enter semantics follow the active mode. [`Mode::Shell`]
+//! is one-shot: Enter runs a command then returns to [`Mode::Prompt`]; Esc
+//! cancels without running. Add variants here when subagent / workflow surfaces
+//! exist; do not infer mode from input prefixes.
 
 /// Active interaction mode.
 ///
@@ -14,7 +15,7 @@ pub enum Mode {
     /// Chat / slash-command prompt (default).
     #[default]
     Prompt,
-    /// One-shot shell commands (entered with `!` on an empty prompt).
+    /// One-shot shell: `!` on an empty prompt; Enter runs then returns to Prompt.
     Shell,
 }
 

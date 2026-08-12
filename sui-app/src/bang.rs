@@ -4,8 +4,8 @@
 //! worker thread with its own current-thread Tokio runtime. That avoids
 //! `block_in_place` (which panics on current-thread runtimes used by many tests).
 //!
-//! Enter shell mode with `!` on an empty prompt; this module only runs the
-//! command once submitted.
+//! Enter shell mode with `!` on an empty prompt; this module runs the command
+//! once submitted. The app returns to [`crate::Mode::Prompt`] afterward.
 
 use sui_tools::{CommandOutput, DEFAULT_RUN_TIMEOUT, ToolsError, run_line};
 
