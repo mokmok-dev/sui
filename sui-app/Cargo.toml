@@ -7,7 +7,9 @@ version.workspace = true
 [dependencies]
 crossterm = { workspace = true }
 ratatui = { workspace = true, features = ["crossterm"] }
+sui-tools = { workspace = true }
 sui-widget = { workspace = true }
+tokio = { workspace = true, features = ["rt"] }
 
 [lints]
 workspace = true

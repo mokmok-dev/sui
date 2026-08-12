@@ -1,8 +1,18 @@
 use super::{App, PROMPT_HEIGHT, char_index_to_byte};
+use crate::app::ScrollbackLine;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::backend::{Backend, TestBackend};
 use ratatui::layout::Position;
 use ratatui::{Terminal, TerminalOptions, Viewport};
+
+fn message_texts(app: &App) -> Vec<&str> {
+    app.messages
+        .iter()
+        .map(|line| match line {
+            ScrollbackLine::Prompt(text) | ScrollbackLine::Ghost(text) => text.as_str(),
+        })
+        .collect()
+}
 
 #[test]
 fn char_index_to_byte_ascii() {
@@ -60,7 +70,7 @@ fn enter_submits_and_clears() {
     app.handle_key(key(KeyCode::Enter));
     assert!(app.input.is_empty());
     assert_eq!(app.cursor_position, 0);
-    assert_eq!(app.messages, vec!["a"]);
+    assert_eq!(message_texts(&app), vec!["a"]);
 }
 
 #[test]
@@ -185,14 +195,81 @@ fn slash_unknown_shows_error() {
     type_and_enter(&mut app, "/foo");
     assert!(!app.should_quit);
     assert!(app.input.is_empty());
-    assert_eq!(app.messages, vec!["unknown command: /foo"]);
+    assert_eq!(message_texts(&app), vec!["unknown command: /foo"]);
 }
 
 #[test]
 fn normal_text_still_adds_to_messages() {
     let mut app = App::new();
     type_and_enter(&mut app, "hello");
-    assert_eq!(app.messages, vec!["hello"]);
+    assert_eq!(message_texts(&app), vec!["hello"]);
+}
+
+#[test]
+fn bang_echo_adds_command_and_stdout() {
+    let mut app = App::new();
+    type_and_enter(&mut app, "! echo bang-app-ok");
+    assert!(app.input.is_empty());
+    assert!(
+        app.messages
+            .iter()
+            .any(|m| m == &ScrollbackLine::Prompt("! echo bang-app-ok".into())),
+        "messages={:?}",
+        app.messages
+    );
+    assert!(
+        app.messages.iter().any(|m| {
+            matches!(
+                m,
+                ScrollbackLine::Ghost(text)
+                    if text.contains("bang-app-ok") && text.as_str() != "! echo bang-app-ok"
+            )
+        }),
+        "expected ghost stdout, messages={:?}",
+        app.messages
+    );
+}
+
+#[test]
+fn bang_empty_shows_usage() {
+    let mut app = App::new();
+    type_and_enter(&mut app, "!");
+    assert_eq!(
+        app.messages,
+        vec![
+            ScrollbackLine::Prompt("!".into()),
+            ScrollbackLine::Prompt("usage: ! <command>".into()),
+        ]
+    );
+}
+
+#[test]
+fn bang_nonzero_exit_is_reported() {
+    let mut app = App::new();
+    type_and_enter(&mut app, "! exit 9");
+    assert!(
+        app.messages
+            .iter()
+            .any(|m| matches!(m, ScrollbackLine::Ghost(text) if text == "exit 9")),
+        "messages={:?}",
+        app.messages
+    );
+}
+
+#[test]
+fn shell_mode_title_while_typing_bang() {
+    let mut app = App::new();
+    assert_eq!(app.prompt_title(), " prompt ");
+    assert!(!app.shell_mode());
+    app.handle_key(key_char('!'));
+    assert!(app.shell_mode());
+    assert_eq!(app.prompt_title(), " shell ");
+    app.handle_key(key_char('e'));
+    assert_eq!(app.prompt_title(), " shell ");
+    app.handle_key(key(KeyCode::Home));
+    app.handle_key(key(KeyCode::Delete));
+    assert!(!app.shell_mode());
+    assert_eq!(app.prompt_title(), " prompt ");
 }
 
 #[test]
@@ -627,6 +704,28 @@ fn flush_messages_writes_above_inline_viewport() {
     let backend = terminal.backend();
     assert_eq!(row(backend, 4), "> hello");
     assert_eq!(row(backend, 5), "> world");
+}
+
+#[test]
+fn flush_ghost_messages_omit_prompt_prefix() {
+    let mut terminal = inline_test_terminal(40, 10, 4);
+
+    let mut app = App::new().with_prompt_prefix("> ");
+    app.add_message("! echo hi");
+    app.add_ghost("hi");
+    infallible(app.flush_messages(&mut terminal));
+
+    let row = |backend: &TestBackend, y: u16| -> String {
+        let area = backend.buffer().area;
+        (0..area.width)
+            .map(|x| backend.buffer()[(x, y)].symbol().to_string())
+            .collect::<String>()
+            .trim_end()
+            .to_string()
+    };
+    let backend = terminal.backend();
+    assert_eq!(row(backend, 4), "> ! echo hi");
+    assert_eq!(row(backend, 5), "hi");
 }
 
 #[test]

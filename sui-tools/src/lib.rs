@@ -5,6 +5,7 @@
 //! - [`tantivy_index`]: persistent Tantivy lexical backend (same corpus walk)
 //! - [`corpus`]: shared tree-walk / skip policy for lexical indexers
 //! - [`bash`]: async non-blocking bash session primitives (pipes, not a PTY)
+//!   plus [`run_line`] for one-shot commands
 //! - [`tool`]: thin [`Tool`] trait + registry with builtin `code_search` / `bash`
 //!
 //! # Threat model
@@ -22,7 +23,10 @@ pub mod error;
 pub mod tantivy_index;
 pub mod tool;
 
-pub use bash::{BashSession, MAX_BUFFER_BYTES, ProcessState, SessionOutput, WaitOutcome};
+pub use bash::{
+    BashSession, CommandOutput, DEFAULT_RUN_TIMEOUT, MAX_BUFFER_BYTES, ProcessState, SessionOutput,
+    WaitOutcome, run_line,
+};
 pub use bm25::{
     Bm25Index, DEFAULT_B, DEFAULT_K1, LexicalSearch, MAX_FILE_BYTES, MAX_INDEX_DOCS, SNIPPET_CHARS,
     SearchHit, tokenize,

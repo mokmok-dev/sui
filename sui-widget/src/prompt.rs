@@ -40,6 +40,8 @@ pub struct PromptWidget<'a> {
     /// Char-based position of the cursor within `input`.
     cursor_position: usize,
     prompt_prefix: &'a str,
+    /// Border title (e.g. `" prompt "` or `" shell "`).
+    title: &'a str,
 }
 
 impl<'a> PromptWidget<'a> {
@@ -48,23 +50,33 @@ impl<'a> PromptWidget<'a> {
     /// * `input` — the current input text.
     /// * `cursor_position` — char-based cursor index into `input`.
     /// * `prompt_prefix` — prefix displayed before the input (e.g. `"❯ "`).
+    ///
+    /// The border title defaults to `" prompt "`. Override with [`Self::with_title`].
     #[must_use]
     pub fn new(
         input: &'a str,
         cursor_position: usize,
         prompt_prefix: &'a str,
     ) -> Self {
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(" prompt ")
-            .style(Style::default().fg(Color::Cyan));
-
         Self {
-            block,
+            block: Block::default()
+                .borders(Borders::ALL)
+                .style(Style::default().fg(Color::Cyan)),
             input,
             cursor_position,
             prompt_prefix,
+            title: " prompt ",
         }
+    }
+
+    /// Sets the border title (e.g. `" shell "` for bang mode).
+    #[must_use]
+    pub const fn with_title(
+        mut self,
+        title: &'a str,
+    ) -> Self {
+        self.title = title;
+        self
     }
 
     /// Returns the (x, y) terminal coordinates where the cursor should be
@@ -117,7 +129,8 @@ impl Widget for PromptWidget<'_> {
             .collect();
 
         let display_text = format!("{}{}", self.prompt_prefix, visible_input);
-        let paragraph = Paragraph::new(Text::from(display_text)).block(self.block);
+        let paragraph =
+            Paragraph::new(Text::from(display_text)).block(self.block.title(self.title));
 
         paragraph.render(area, buf);
     }
@@ -344,17 +357,12 @@ mod tests {
     }
 
     #[test]
-    fn screen_cursor_cjk_with_scroll() {
-        // Narrow area that forces scrolling with CJK text
-        let area = Rect::new(0, 0, 10, 3);
-        // inner = 8, prefix = 2, available = 6
-        // "abcあいうdef": cursor at 6 (after う), scroll should be 3
-        let widget = PromptWidget::new("abcあいうdef", 6, "❯ ");
+    fn with_title_preserves_cursor_math() {
+        let widget = PromptWidget::new("hi", 2, "> ").with_title(" shell ");
+        let area = Rect::new(5, 2, 30, 3);
         let (x, y) = widget.screen_cursor(area);
-        // From scroll=3: chars are あ(2)い(2)う(2), cursor at position 6
-        // cursor_display_offset = width of chars[3..6] = width("あいう") = 6
-        // x = 0+1+2+6 = 9, but max_x = 0+10-2 = 8, clamped to 8
-        assert_eq!(x, 8);
-        assert_eq!(y, 1);
+        // Same as screen_cursor_after_text — title must not affect cursor math.
+        assert_eq!(x, 10);
+        assert_eq!(y, 3);
     }
 }

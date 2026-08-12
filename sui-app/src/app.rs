@@ -3,6 +3,7 @@ use ratatui::{
     DefaultTerminal, Frame, Terminal, TerminalOptions, Viewport,
     backend::{Backend, CrosstermBackend},
     layout::{Constraint, Layout, Position},
+    style::{Modifier, Style},
     widgets::{Paragraph, Widget},
 };
 use sui_widget::PromptWidget;
@@ -17,7 +18,21 @@ pub const PROMPT_HEIGHT: u16 = 3;
 const SUGGESTION_PANEL_HEIGHT: u16 = 5;
 const _: () = assert!(SUGGESTION_PANEL_HEIGHT as usize == MAX_CANDIDATES);
 
-/// Holds the full application state: prompt input, submitted messages, and the
+/// Border title while the prompt accepts normal / slash input.
+const PROMPT_TITLE: &str = " prompt ";
+/// Border title while bang (`!`) shell mode is active.
+const SHELL_TITLE: &str = " shell ";
+
+/// A single scrollback line pending flush above the inline viewport.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ScrollbackLine {
+    /// User / status line rendered with the prompt prefix.
+    Prompt(String),
+    /// Dim ghost text (shell stdout/stderr) without the prompt prefix.
+    Ghost(String),
+}
+
+/// Holds the full application state: prompt input, message history, and the
 /// run-loop flag.
 ///
 /// # Example
@@ -35,12 +50,12 @@ pub struct App {
     pub(crate) cursor_position: usize,
     pub(crate) should_quit: bool,
     pub(crate) prompt_prefix: String,
-    /// History of submitted prompts / status lines.
+    /// History of submitted prompts / status / ghost lines.
     ///
     /// New entries are committed above the inline viewport via
     /// [`Terminal::insert_before`] so they scroll into the terminal scrollback
     /// while the prompt stays pinned once it reaches the bottom of the screen.
-    pub(crate) messages: Vec<String>,
+    pub(crate) messages: Vec<ScrollbackLine>,
     /// How many messages have already been written above the viewport.
     pub(crate) flushed_messages: usize,
     /// Current [`Viewport::Inline`] height managed by [`App::run`].
@@ -82,7 +97,7 @@ impl App {
         self.should_quit = true;
     }
 
-    /// Append a message to the message history.
+    /// Append a normal (prompt-prefixed) message to the scrollback history.
     ///
     /// The next [`App::run`] iteration (or [`App::flush_messages`]) writes it
     /// above the inline prompt into the terminal scrollback.
@@ -90,7 +105,31 @@ impl App {
         &mut self,
         msg: impl Into<String>,
     ) {
-        self.messages.push(msg.into());
+        self.messages.push(ScrollbackLine::Prompt(msg.into()));
+    }
+
+    /// Append dim ghost text (e.g. shell command output) to the scrollback.
+    pub fn add_ghost(
+        &mut self,
+        msg: impl Into<String>,
+    ) {
+        self.messages.push(ScrollbackLine::Ghost(msg.into()));
+    }
+
+    /// Whether the prompt is in bang (`!`) shell mode.
+    #[must_use]
+    pub(crate) fn shell_mode(&self) -> bool {
+        self.input.starts_with('!')
+    }
+
+    /// Border title for the current input mode.
+    #[must_use]
+    pub(crate) fn prompt_title(&self) -> &'static str {
+        if self.shell_mode() {
+            SHELL_TITLE
+        } else {
+            PROMPT_TITLE
+        }
     }
 
     /// Register a pluggable slash command.
@@ -199,6 +238,9 @@ impl App {
 
     /// Writes any unflushed messages above the inline viewport.
     ///
+    /// Prompt lines include [`Self::prompt_prefix`]. Ghost lines are dim and
+    /// unprefixed.
+    ///
     /// Once the viewport reaches the bottom of the terminal, further inserts
     /// scroll prior output into the scrollback buffer and keep the prompt pinned.
     ///
@@ -209,13 +251,23 @@ impl App {
         terminal: &mut Terminal<B>,
     ) -> Result<(), B::Error> {
         while self.flushed_messages < self.messages.len() {
-            let line = format!(
-                "{}{}",
-                self.prompt_prefix, self.messages[self.flushed_messages]
-            );
-            terminal.insert_before(1, move |buf| {
-                Paragraph::new(line).render(buf.area, buf);
-            })?;
+            let line = &self.messages[self.flushed_messages];
+            match line {
+                ScrollbackLine::Prompt(text) => {
+                    let rendered = format!("{}{text}", self.prompt_prefix);
+                    terminal.insert_before(1, move |buf| {
+                        Paragraph::new(rendered).render(buf.area, buf);
+                    })?;
+                },
+                ScrollbackLine::Ghost(text) => {
+                    let rendered = text.clone();
+                    terminal.insert_before(1, move |buf| {
+                        Paragraph::new(rendered)
+                            .style(Style::default().add_modifier(Modifier::DIM))
+                            .render(buf.area, buf);
+                    })?;
+                },
+            }
             self.flushed_messages += 1;
         }
         Ok(())
@@ -269,7 +321,8 @@ impl App {
         ])
         .areas(area);
 
-        let prompt = PromptWidget::new(&self.input, self.cursor_position, &self.prompt_prefix);
+        let prompt = PromptWidget::new(&self.input, self.cursor_position, &self.prompt_prefix)
+            .with_title(self.prompt_title());
         let cursor_pos = prompt.screen_cursor(prompt_area);
         frame.render_widget(prompt, prompt_area);
         frame.set_cursor_position((cursor_pos.0, cursor_pos.1));
