@@ -1,3 +1,4 @@
+use crate::app::PendingLlm;
 use crate::mode::Mode;
 use crate::{App, char_index_to_byte};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
@@ -42,12 +43,12 @@ impl App {
         self.slash_selected = 0;
     }
 
-    /// Sends a user turn to the configured LLM and appends the reply as
-    /// [`crate::app::ScrollbackLine::Reply`] lines.
+    /// Queues a user turn to the configured LLM.
     ///
-    /// Blocks the event loop until the Proxy responds or hits
-    /// [`crate::llm::DEFAULT_CHAT_TIMEOUT`]. Streaming is intentionally out of
-    /// scope for this sync TUI path.
+    /// Returns immediately after spawning the worker; the event loop polls
+    /// [`crate::App::poll_pending_llm`] and animates a working spinner until
+    /// the reply arrives (or [`crate::llm::DEFAULT_CHAT_TIMEOUT`] fires).
+    /// Streaming is intentionally out of scope for this sync TUI path.
     pub(crate) fn handle_chat_prompt(
         &mut self,
         prompt: &str,
@@ -62,19 +63,8 @@ impl App {
 
         self.chat_history
             .push(sui_llm::ChatMessage::user(prompt.to_owned()));
-        match crate::llm::chat_blocking(&client, &self.chat_history) {
-            Ok(response) => {
-                self.chat_history
-                    .push(sui_llm::ChatMessage::assistant(response.content.clone()));
-                for line in response.content.lines() {
-                    self.add_reply(line);
-                }
-            },
-            Err(error) => {
-                let _ = self.chat_history.pop();
-                self.add_message(format!("llm error: {error}"));
-            },
-        }
+        let rx = crate::llm::chat_spawn(&client, &self.chat_history);
+        self.pending_llm = Some(PendingLlm::new(rx));
     }
 
     /// Runs a one-shot shell command via [`crate::bang`].
@@ -112,6 +102,23 @@ impl App {
         &mut self,
         key: KeyEvent,
     ) {
+        // While waiting on the LLM, only allow quit — ignore further input so
+        // a second prompt cannot race the in-flight request.
+        if self.pending_llm.is_some() {
+            match key.code {
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.abandon_pending_llm();
+                    self.should_quit = true;
+                },
+                KeyCode::Esc => {
+                    self.abandon_pending_llm();
+                    self.should_quit = true;
+                },
+                _ => {},
+            }
+            return;
+        }
+
         match key.code {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.should_quit = true;

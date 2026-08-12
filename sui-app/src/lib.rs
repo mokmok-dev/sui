@@ -11,7 +11,9 @@
 //!
 //! Interaction uses explicit [`Mode`] state, not input-prefix inference:
 //! - [`Mode::Prompt`] (default) — chat via optional [`sui_llm::LlmClient`];
-//!   `/` opens slash commands
+//!   `/` opens slash commands. While a chat request is in flight the prompt
+//!   border shows a working spinner and further input is ignored (Ctrl-C / Esc
+//!   still quit).
 //! - [`Mode::Shell`] — entered with `!` on an empty prompt; Enter runs bash
 //!   via [`sui_tools::run_line`], then returns to [`Mode::Prompt`]; Esc cancels
 //!   back to Prompt without running; output is flushed as dim ghost text

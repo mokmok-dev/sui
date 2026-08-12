@@ -7,8 +7,25 @@ use ratatui::{
     style::{Modifier, Style},
     widgets::{Paragraph, Widget},
 };
-use sui_llm::{ChatMessage, LlmClient};
+use std::sync::mpsc::{Receiver, TryRecvError};
+use std::time::Instant;
+use sui_llm::{ChatMessage, ChatResponse, LlmClient};
 use sui_widget::PromptWidget;
+
+/// In-flight LLM chat: worker result channel + spinner clock.
+pub(crate) struct PendingLlm {
+    rx: Receiver<Result<ChatResponse, String>>,
+    started: Instant,
+}
+
+impl PendingLlm {
+    pub(crate) fn new(rx: Receiver<Result<ChatResponse, String>>) -> Self {
+        Self {
+            rx,
+            started: Instant::now(),
+        }
+    }
+}
 
 /// Rows occupied by the bordered prompt widget.
 pub const PROMPT_HEIGHT: u16 = 3;
@@ -75,6 +92,8 @@ pub struct App {
     pub(crate) llm: Option<LlmClient>,
     /// Session chat turns sent to the Proxy (user + assistant only).
     pub(crate) chat_history: Vec<ChatMessage>,
+    /// Active LLM request (event loop polls; spinner animates until it lands).
+    pub(crate) pending_llm: Option<PendingLlm>,
 }
 
 impl Default for App {
@@ -101,6 +120,7 @@ impl App {
             slash_selected: 0,
             llm: None,
             chat_history: Vec::new(),
+            pending_llm: None,
         }
     }
 
@@ -272,12 +292,93 @@ impl App {
         terminal: &mut DefaultTerminal,
     ) -> std::io::Result<()> {
         while !self.should_quit {
+            self.poll_pending_llm();
             self.flush_messages(terminal)?;
             self.sync_viewport_height(terminal)?;
             terminal.draw(|frame| self.render(frame))?;
-            self.handle_event(&crossterm::event::read()?);
+            if self.pending_llm.is_some() {
+                // Short poll so the spinner advances while the worker runs.
+                if crossterm::event::poll(crate::llm::SPINNER_TICK)? {
+                    self.handle_event(&crossterm::event::read()?);
+                }
+            } else {
+                self.handle_event(&crossterm::event::read()?);
+            }
         }
         Ok(())
+    }
+
+    /// Applies a completed chat result to history / scrollback.
+    pub(crate) fn apply_chat_result(
+        &mut self,
+        result: Result<ChatResponse, String>,
+    ) {
+        match result {
+            Ok(response) => {
+                self.chat_history
+                    .push(sui_llm::ChatMessage::assistant(response.content.clone()));
+                for line in response.content.lines() {
+                    self.add_reply(line);
+                }
+            },
+            Err(error) => {
+                let _ = self.chat_history.pop();
+                self.add_message(format!("llm error: {error}"));
+            },
+        }
+    }
+
+    /// Non-blocking check for an in-flight LLM response.
+    pub(crate) fn poll_pending_llm(&mut self) {
+        let result = {
+            let Some(pending) = &self.pending_llm else {
+                return;
+            };
+            match pending.rx.try_recv() {
+                Ok(result) => Some(result),
+                Err(TryRecvError::Empty) => None,
+                Err(TryRecvError::Disconnected) => {
+                    Some(Err("llm worker disconnected".into()))
+                },
+            }
+        };
+        if let Some(result) = result {
+            self.pending_llm = None;
+            self.apply_chat_result(result);
+        }
+    }
+
+    /// Drop an in-flight request and roll back the optimistic user turn.
+    ///
+    /// Used when quitting mid-request so [`Self::chat_history`] stays paired.
+    pub(crate) fn abandon_pending_llm(&mut self) {
+        if self.pending_llm.take().is_some() {
+            let _ = self.chat_history.pop();
+        }
+    }
+
+    /// Blocks until any in-flight LLM request finishes (tests / sync callers).
+    #[cfg(test)]
+    pub(crate) fn settle_pending_llm(&mut self) {
+        let Some(pending) = self.pending_llm.take() else {
+            return;
+        };
+        let result = pending
+            .rx
+            .recv()
+            .unwrap_or_else(|_| Err("llm worker disconnected".into()));
+        self.apply_chat_result(result);
+    }
+
+    /// Border title: mode title normally, animated working spinner while waiting.
+    pub(crate) fn prompt_title_for_render(&self) -> String {
+        self.pending_llm.as_ref().map_or_else(
+            || self.prompt_title().to_owned(),
+            |pending| {
+                let glyph = crate::llm::spinner_glyph(pending.started.elapsed());
+                format!(" working {glyph} ")
+            },
+        )
     }
 
     /// Clears the inline viewport and parks the cursor at its top-left origin.
@@ -383,8 +484,9 @@ impl App {
         ])
         .areas(area);
 
+        let title = self.prompt_title_for_render();
         let prompt = PromptWidget::new(&self.input, self.cursor_position, &self.prompt_prefix)
-            .with_title(self.prompt_title());
+            .with_title(&title);
         let cursor_pos = prompt.screen_cursor(prompt_area);
         frame.render_widget(prompt, prompt_area);
         frame.set_cursor_position((cursor_pos.0, cursor_pos.1));
