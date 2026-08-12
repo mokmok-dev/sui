@@ -4,7 +4,7 @@
 //! cargo run -p sui-tools --example smoke_builtin -- /path/to/repo
 //! ```
 
-use std::{env, path::PathBuf, time::Duration};
+use std::{env, path::PathBuf};
 
 use serde_json::json;
 use sui_tools::{Bm25Index, ToolsError, builtin_registry};
@@ -47,49 +47,24 @@ async fn main() -> Result<(), ToolsError> {
         ));
     }
 
-    let written = registry
+    let ran = registry
         .call(
             "bash",
             json!({
-                "command": "printf 'smoke-ok %s\\n' \"$(basename \"$PWD\")\"",
-                "drain": false
+                "command": "printf 'smoke-ok %s\\n' \"$(basename \"$PWD\")\""
             }),
         )
         .await?;
     println!(
-        "\n=== bash write (drain:false) ===\n{}",
-        serde_json::to_string_pretty(&written)?
+        "\n=== bash run ===\n{}",
+        serde_json::to_string_pretty(&ran)?
     );
-
-    tokio::time::sleep(Duration::from_millis(80)).await;
-    let drained = registry.call("bash", json!({ "action": "drain" })).await?;
-    println!(
-        "\n=== bash drain ===\n{}",
-        serde_json::to_string_pretty(&drained)?
-    );
-    let stdout = drained["stdout"].as_str().unwrap_or_default();
+    let stdout = ran["stdout"].as_str().unwrap_or_default();
     if !stdout.contains("smoke-ok") {
         return Err(ToolsError::Bash(format!(
             "expected smoke-ok in stdout, got {stdout:?}"
         )));
     }
-
-    let polled = registry.call("bash", json!({ "action": "poll" })).await?;
-    println!(
-        "\n=== bash poll ===\n{}",
-        serde_json::to_string_pretty(&polled)?
-    );
-
-    let _ = registry
-        .call("bash", json!({ "command": "exit", "drain": false }))
-        .await?;
-    let waited = registry
-        .call("bash", json!({ "action": "wait", "timeout_ms": 3000 }))
-        .await?;
-    println!(
-        "\n=== bash wait ===\n{}",
-        serde_json::to_string_pretty(&waited)?
-    );
 
     println!("\nsmoke_builtin: OK");
     Ok(())

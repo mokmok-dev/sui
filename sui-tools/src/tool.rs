@@ -33,7 +33,7 @@ pub const MAX_SEARCH_LIMIT: usize = 100;
 /// Default wait after a bash `write` before draining when `timeout_ms` is omitted.
 const DEFAULT_WRITE_DRAIN_MS: u64 = 50;
 /// Cap on `timeout_ms` so a single tool call cannot hold the session lock indefinitely.
-const MAX_TIMEOUT_MS: u64 = 60_000;
+const MAX_TIMEOUT_MS: u64 = 300_000;
 
 /// Boxed future returned by [`Tool::call`].
 pub type ToolFuture<'a> = Pin<Box<dyn Future<Output = Result<Value, ToolsError>> + Send + 'a>>;
@@ -57,7 +57,7 @@ pub trait Tool: Send + Sync {
 }
 
 /// Registry of named tools.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
 }
@@ -202,15 +202,21 @@ struct CodeSearchArgs {
 ///
 /// # Arguments
 ///
-/// - `action` (string, optional): `write` (default) | `drain` | `poll` | `wait` | `kill`
-/// - `command` (string): required for `write` (or when `action` omitted); single line, no NUL/CR/LF
-/// - `timeout_ms` (integer, optional): for `write`, wait before drain; for `wait`, max wait
+/// - `action` (string, optional): `run` (default) | `write` | `drain` | `poll` | `wait` | `kill`
+/// - `command` (string): required for `run` and `write`; single line, no NUL/CR/LF
+/// - `timeout_ms` (integer, optional): for `run`, wall-clock budget (default 30000);
+///   for `write`, wait before drain; for `wait`, max wait
 /// - `drain` (bool, optional): for `write` only; if false, skip post-write drain (default true)
+///
+/// `run` starts a **fresh** bash process via [`crate::run_line`] (what the model
+/// should use). Session actions (`write`/`drain`/`poll`/`wait`/`kill`) share
+/// one persistent shell and must be named explicitly.
 ///
 /// Concurrent `drain:true` writes may interleave because the pre-drain sleep
 /// does not hold the session mutex. Prefer `drain:false` + poll for concurrency.
 pub struct BashTool {
     session: Mutex<BashSession>,
+    cwd: Option<std::path::PathBuf>,
 }
 
 impl BashTool {
@@ -219,6 +225,7 @@ impl BashTool {
     pub fn new(session: BashSession) -> Self {
         Self {
             session: Mutex::new(session),
+            cwd: None,
         }
     }
 
@@ -228,7 +235,10 @@ impl BashTool {
     ///
     /// Propagates [`BashSession::spawn`] errors.
     pub fn spawn(cwd: Option<&std::path::Path>) -> Result<Self, ToolsError> {
-        Ok(Self::new(BashSession::spawn(cwd)?))
+        Ok(Self {
+            session: Mutex::new(BashSession::spawn(cwd)?),
+            cwd: cwd.map(std::path::Path::to_path_buf),
+        })
     }
 
     async fn wait_action(
@@ -280,7 +290,9 @@ impl Tool for BashTool {
 
     #[allow(clippy::unnecessary_literal_bound)]
     fn description(&self) -> &str {
-        "Manage a persistent unsandboxed bash session (write/drain/poll/wait/kill). Prefer code_search for discovery."
+        "Run a shell command. Default action is `run` (fresh process, waits for exit). \
+         Pass `command` (single line) and optional `timeout_ms` (default 30000). \
+         Prefer this over write/drain/poll. Session actions: write, drain, poll, wait, kill."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -289,16 +301,16 @@ impl Tool for BashTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["write", "drain", "poll", "wait", "kill"],
-                    "description": "Session action (default write)"
+                    "enum": ["run", "write", "drain", "poll", "wait", "kill"],
+                    "description": "Session action (default run)"
                 },
                 "command": {
                     "type": "string",
-                    "description": "Shell command for action=write (single line)"
+                    "description": "Shell command for action=run or action=write (single line)"
                 },
                 "timeout_ms": {
                     "type": "integer",
-                    "description": "Milliseconds to wait (write drain delay or wait timeout)",
+                    "description": "Milliseconds to wait (run budget, write drain delay, or wait timeout)",
                     "minimum": 0
                 },
                 "drain": {
@@ -320,9 +332,29 @@ impl Tool for BashTool {
         Box::pin(async move {
             let args: BashArgs = serde_json::from_value(args)
                 .map_err(|error| ToolsError::InvalidArgs(error.to_string()))?;
-            let action = args.action.as_deref().unwrap_or("write");
+            let action = args.action.as_deref().unwrap_or("run");
 
             match action {
+                "run" => {
+                    let command = args.command.as_deref().ok_or_else(|| {
+                        ToolsError::InvalidArgs("command is required for action=run".into())
+                    })?;
+                    validate_single_line(command)?;
+                    let wait_ms = args.timeout_ms.unwrap_or(30_000).min(MAX_TIMEOUT_MS);
+                    let output = crate::run_line(
+                        command,
+                        self.cwd.as_deref(),
+                        Duration::from_millis(wait_ms),
+                    )
+                    .await?;
+                    Ok(json!({
+                        "stdout": output.stdout,
+                        "stderr": output.stderr,
+                        "code": output.code,
+                        "timed_out": output.timed_out,
+                        "truncated": output.truncated,
+                    }))
+                },
                 "write" => {
                     let command = args.command.as_deref().ok_or_else(|| {
                         ToolsError::InvalidArgs("command is required for action=write".into())
@@ -421,12 +453,30 @@ pub fn code_search_registry(index: impl LexicalSearch + 'static) -> ToolRegistry
     registry
 }
 
+/// Builds a registry with `code_search`, `edit`, and `bash` when spawn works.
+///
+/// Unlike [`builtin_registry`], bash spawn failure does not fail the whole
+/// registry — `code_search` and `edit` still register.
+#[must_use]
+pub fn coding_registry(
+    index: impl LexicalSearch + 'static,
+    bash_cwd: Option<&std::path::Path>,
+) -> ToolRegistry {
+    let mut registry = code_search_registry(index);
+    registry.register(crate::edit::EditTool::new());
+    if let Ok(bash) = BashTool::spawn(bash_cwd) {
+        registry.register(bash);
+    }
+    registry
+}
+
 /// Builds a registry with `code_search`, `bash`, and `edit` builtins.
 ///
 /// # Errors
 ///
 /// Returns an error if the bash session cannot be spawned.
-/// Prefer [`code_search_registry`] when bash is unavailable or unwanted.
+/// Prefer [`coding_registry`] when bash is optional, or [`code_search_registry`]
+/// when bash is unavailable or unwanted.
 pub fn builtin_registry(
     index: impl LexicalSearch + 'static,
     bash_cwd: Option<&std::path::Path>,
@@ -537,7 +587,7 @@ mod tests {
         let written = registry
             .call(
                 "bash",
-                json!({ "command": "echo action-ok", "drain": false }),
+                json!({ "action": "write", "command": "echo action-ok", "drain": false }),
             )
             .await?;
         assert_eq!(written["written"], true);
@@ -549,7 +599,10 @@ mod tests {
         assert!(polled["state"]["running"].as_bool().unwrap_or(false));
 
         let _ = registry
-            .call("bash", json!({ "command": "exit", "drain": false }))
+            .call(
+                "bash",
+                json!({ "action": "write", "command": "exit", "drain": false }),
+            )
             .await?;
         let waited = registry
             .call("bash", json!({ "action": "wait", "timeout_ms": 3000 }))
@@ -569,6 +622,7 @@ mod tests {
             .call(
                 "bash",
                 json!({
+                    "action": "write",
                     "command": "echo drain-true-ok",
                     "drain": true,
                     "timeout_ms": 200
@@ -592,7 +646,10 @@ mod tests {
         registry.register(tool);
 
         let _ = registry
-            .call("bash", json!({ "command": "sleep 30", "drain": false }))
+            .call(
+                "bash",
+                json!({ "action": "write", "command": "sleep 30", "drain": false }),
+            )
             .await?;
         tokio::time::sleep(Duration::from_millis(50)).await;
         let killed = registry.call("bash", json!({ "action": "kill" })).await?;
@@ -611,6 +668,7 @@ mod tests {
             .call(
                 "bash",
                 json!({
+                    "action": "write",
                     "command": "echo before-hang; sleep 30",
                     "drain": false
                 }),
@@ -628,6 +686,22 @@ mod tests {
             stdout.contains("before-hang"),
             "expected partial stdout, got: {stdout:?}"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bash_run_echo() -> Result<(), ToolsError> {
+        let tool = BashTool::spawn(None)?;
+        let mut registry = ToolRegistry::new();
+        registry.register(tool);
+
+        let result = registry
+            .call("bash", json!({ "command": "echo run-ok" }))
+            .await?;
+        assert_eq!(result["timed_out"], false);
+        assert_eq!(result["code"], 0);
+        let stdout = result["stdout"].as_str().unwrap_or("");
+        assert!(stdout.contains("run-ok"), "stdout={stdout:?}");
         Ok(())
     }
 
