@@ -4,7 +4,7 @@
 //! deltas can be painted on every frame without re-parsing the full document.
 
 use markdown::{Event, Parser, StreamParser};
-use markdown_ratatui::{render_with, Theme};
+use markdown_ratatui::{Theme, render_with};
 use ratatui::text::{Line, Text};
 
 /// Incremental Markdown state for an in-flight assistant reply.
@@ -86,9 +86,10 @@ mod tests {
         stream.push_delta("**, done");
         stream.finish();
         let lines = stream.render_lines(80);
-        let has_bold = lines.iter().flat_map(|l| &l.spans).any(|s| {
-            s.style.add_modifier(Modifier::BOLD) == s.style && s.content.contains("fugu")
-        });
+        let has_bold = lines
+            .iter()
+            .flat_map(|l| &l.spans)
+            .any(|s| s.style.add_modifier(Modifier::BOLD) == s.style && s.content.contains("fugu"));
         assert!(has_bold, "expected bold fugu, lines={lines:?}");
     }
 

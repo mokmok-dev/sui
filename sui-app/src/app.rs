@@ -1,4 +1,4 @@
-use crate::markdown::{render_markdown, StreamingMarkdown};
+use crate::markdown::{StreamingMarkdown, render_markdown};
 use crate::mode::Mode;
 use crate::slash::{MAX_CANDIDATES, SlashCandidate, SlashCommand};
 use ratatui::{
@@ -400,9 +400,9 @@ impl App {
             match pending.rx.try_recv() {
                 Ok(msg) => Some(msg),
                 Err(TryRecvError::Empty) => None,
-                Err(TryRecvError::Disconnected) => {
-                    Some(crate::llm::LlmStreamMsg::Failed("llm worker disconnected".into()))
-                },
+                Err(TryRecvError::Disconnected) => Some(crate::llm::LlmStreamMsg::Failed(
+                    "llm worker disconnected".into(),
+                )),
             }
         };
         if let Some(msg) = msg
@@ -569,8 +569,7 @@ impl App {
     ) {
         let area = frame.area();
         let width = area.width;
-        let prompt_height =
-            PromptWidget::block_height(&self.input, &self.prompt_prefix, width);
+        let prompt_height = PromptWidget::block_height(&self.input, &self.prompt_prefix, width);
         let streaming_height = self
             .streaming_reply
             .as_ref()
