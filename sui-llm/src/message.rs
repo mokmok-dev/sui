@@ -10,7 +10,12 @@ pub enum Role {
 }
 
 /// A single text chat message.
+///
+/// Prefer [`ChatMessage::system`], [`ChatMessage::user`], and
+/// [`ChatMessage::assistant`] over struct literals so new fields remain
+/// non-breaking (`#[non_exhaustive]` rejects crate-external literals).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ChatMessage {
     /// Who authored the message.
     pub role: Role,
