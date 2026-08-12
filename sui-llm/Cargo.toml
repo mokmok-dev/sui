@@ -1,0 +1,18 @@
+[package]
+description = "Thin OpenAI-compatible LLM client pointed at a LiteLLM Proxy (base_url + api_key + model)."
+edition.workspace = true
+name = "sui-llm"
+version.workspace = true
+
+[dependencies]
+async-openai = { workspace = true }
+futures = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+wiremock = { workspace = true }
+
+[lints]
+workspace = true
