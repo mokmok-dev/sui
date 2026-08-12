@@ -96,7 +96,7 @@ impl App {
         self.should_quit = true;
     }
 
-    /// Current sticky interaction mode.
+    /// Current interaction mode.
     #[must_use]
     pub const fn mode(&self) -> Mode {
         self.mode

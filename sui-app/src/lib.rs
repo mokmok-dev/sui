@@ -9,11 +9,11 @@
 //!
 //! # Modes
 //!
-//! Interaction is sticky [`Mode`] state (vim-like), not inferred from prefixes:
+//! Interaction uses explicit [`Mode`] state, not input-prefix inference:
 //! - [`Mode::Prompt`] (default) — chat text; `/` opens slash commands
 //! - [`Mode::Shell`] — entered with `!` on an empty prompt; Enter runs bash
-//!   via [`sui_tools::run_line`]; Esc returns to [`Mode::Prompt`]; output is
-//!   flushed as dim ghost text (no prompt prefix)
+//!   via [`sui_tools::run_line`], then returns to [`Mode::Prompt`]; Esc cancels
+//!   back to Prompt without running; output is flushed as dim ghost text
 //!
 //! Future surfaces (subagent, workflow) should add [`Mode`] variants rather
 //! than new prefix heuristics.
