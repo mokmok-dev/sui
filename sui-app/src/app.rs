@@ -90,6 +90,12 @@ pub struct App {
     pub(crate) slash_candidates: Vec<SlashCandidate>,
     /// Currently highlighted index within `slash_candidates`.
     pub(crate) slash_selected: usize,
+    /// Workspace file paths matching the active `@`-mention token.
+    pub(crate) at_candidates: Vec<String>,
+    /// Currently highlighted index within `at_candidates`.
+    pub(crate) at_selected: usize,
+    /// Lazily-walked workspace file list backing the `@`-mention picker.
+    pub(crate) file_cache: Option<Vec<String>>,
     /// Optional `LiteLLM` Proxy client for [`Mode::Prompt`] chat.
     pub(crate) llm: Option<LlmClient>,
     /// Session chat turns sent to the Proxy (user + assistant only).
@@ -122,6 +128,9 @@ impl App {
             plugins: Vec::new(),
             slash_candidates: Vec::new(),
             slash_selected: 0,
+            at_candidates: Vec::new(),
+            at_selected: 0,
+            file_cache: None,
             llm: None,
             chat_history: Vec::new(),
             pending_llm: None,
@@ -164,6 +173,44 @@ impl App {
         self.cursor_position = 0;
         self.slash_candidates.clear();
         self.slash_selected = 0;
+        self.at_candidates.clear();
+        self.at_selected = 0;
+    }
+
+    /// Rebuilds every suggestion panel (slash commands and `@`-mentions) from
+    /// the current input. The two are mutually exclusive, so at most one panel
+    /// is populated afterward.
+    pub(crate) fn refresh_suggestions(&mut self) {
+        self.update_slash_candidates();
+        self.update_at_candidates();
+    }
+
+    /// Number of rows the active suggestion panel occupies (0 when closed).
+    ///
+    /// Slash and `@`-mention panels never open together, so the larger of the
+    /// two counts is the active one.
+    #[must_use]
+    pub(crate) fn suggestion_count(&self) -> usize {
+        self.slash_candidates.len().max(self.at_candidates.len())
+    }
+
+    /// Moves the highlight within whichever suggestion panel is open, wrapping.
+    pub(crate) fn cycle_suggestion(
+        &mut self,
+        forward: bool,
+    ) {
+        let step = |selected: usize, len: usize| {
+            if forward {
+                (selected + 1) % len
+            } else {
+                (selected + len - 1) % len
+            }
+        };
+        if !self.slash_candidates.is_empty() {
+            self.slash_selected = step(self.slash_selected, self.slash_candidates.len());
+        } else if !self.at_candidates.is_empty() {
+            self.at_selected = step(self.at_selected, self.at_candidates.len());
+        }
     }
 
     /// Append a normal (prompt-prefixed) message to the scrollback history.
@@ -243,7 +290,7 @@ impl App {
             .streaming_reply
             .as_ref()
             .map_or(0, |reply| reply.line_count(width as usize));
-        let suggestions_height = if self.slash_candidates.is_empty() {
+        let suggestions_height = if self.suggestion_count() == 0 {
             0
         } else {
             SUGGESTION_PANEL_HEIGHT
@@ -574,10 +621,10 @@ impl App {
             .streaming_reply
             .as_ref()
             .map_or(0, |reply| reply.line_count(width as usize));
-        let suggestions_height = if self.slash_candidates.is_empty() {
+        let suggestions_height = if self.suggestion_count() == 0 {
             0
         } else {
-            u16::try_from(self.slash_candidates.len().min(MAX_CANDIDATES)).unwrap_or(u16::MAX)
+            u16::try_from(self.suggestion_count().min(MAX_CANDIDATES)).unwrap_or(u16::MAX)
         };
 
         let [streaming_area, prompt_area, suggestions_area, _reserved] = Layout::vertical([
@@ -605,6 +652,8 @@ impl App {
 
         if !self.slash_candidates.is_empty() {
             self.render_slash_suggestions(frame, suggestions_area);
+        } else if !self.at_candidates.is_empty() {
+            self.render_at_suggestions(frame, suggestions_area);
         }
     }
 }
