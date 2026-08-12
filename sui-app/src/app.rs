@@ -7,6 +7,7 @@ use ratatui::{
     style::{Modifier, Style},
     widgets::{Paragraph, Widget},
 };
+use sui_llm::{ChatMessage, LlmClient};
 use sui_widget::PromptWidget;
 
 /// Rows occupied by the bordered prompt widget.
@@ -26,6 +27,8 @@ pub(crate) enum ScrollbackLine {
     Prompt(String),
     /// Dim ghost text (shell stdout/stderr) without the prompt prefix.
     Ghost(String),
+    /// Assistant reply text without the prompt prefix (normal intensity).
+    Reply(String),
 }
 
 /// Holds the full application state: prompt input, message history, and the
@@ -35,8 +38,12 @@ pub(crate) enum ScrollbackLine {
 ///
 /// ```no_run
 /// use sui_app::App;
+/// use sui_llm::LlmClient;
 ///
 /// let mut app = App::new();
+/// if let Ok(client) = LlmClient::from_env() {
+///     app = app.with_llm(client);
+/// }
 /// app.run_inline()?;
 /// # Ok::<(), std::io::Error>(())
 /// ```
@@ -64,6 +71,10 @@ pub struct App {
     pub(crate) slash_candidates: Vec<SlashCandidate>,
     /// Currently highlighted index within `slash_candidates`.
     pub(crate) slash_selected: usize,
+    /// Optional `LiteLLM` Proxy client for [`Mode::Prompt`] chat.
+    pub(crate) llm: Option<LlmClient>,
+    /// Session chat turns sent to the Proxy (user + assistant only).
+    pub(crate) chat_history: Vec<ChatMessage>,
 }
 
 impl Default for App {
@@ -88,7 +99,23 @@ impl App {
             plugins: Vec::new(),
             slash_candidates: Vec::new(),
             slash_selected: 0,
+            llm: None,
+            chat_history: Vec::new(),
         }
+    }
+
+    /// Attach an LLM client for prompt-mode chat.
+    ///
+    /// Without this, prompt submits surface a configuration hint instead of
+    /// calling the Proxy. Typical wiring:
+    /// `App::new().with_llm(LlmClient::from_env()?)`.
+    #[must_use]
+    pub fn with_llm(
+        mut self,
+        client: LlmClient,
+    ) -> Self {
+        self.llm = Some(client);
+        self
     }
 
     /// Request application shutdown.
@@ -131,6 +158,14 @@ impl App {
         msg: impl Into<String>,
     ) {
         self.messages.push(ScrollbackLine::Ghost(msg.into()));
+    }
+
+    /// Append an assistant reply line (no prompt prefix, normal intensity).
+    pub fn add_reply(
+        &mut self,
+        msg: impl Into<String>,
+    ) {
+        self.messages.push(ScrollbackLine::Reply(msg.into()));
     }
 
     /// Border title for the current mode.
@@ -286,6 +321,12 @@ impl App {
                         Paragraph::new(rendered)
                             .style(Style::default().add_modifier(Modifier::DIM))
                             .render(buf.area, buf);
+                    })?;
+                },
+                ScrollbackLine::Reply(text) => {
+                    let rendered = text.clone();
+                    terminal.insert_before(1, move |buf| {
+                        Paragraph::new(rendered).render(buf.area, buf);
                     })?;
                 },
             }

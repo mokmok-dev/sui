@@ -9,7 +9,9 @@ fn message_texts(app: &App) -> Vec<&str> {
     app.messages
         .iter()
         .map(|line| match line {
-            ScrollbackLine::Prompt(text) | ScrollbackLine::Ghost(text) => text.as_str(),
+            ScrollbackLine::Prompt(text)
+            | ScrollbackLine::Ghost(text)
+            | ScrollbackLine::Reply(text) => text.as_str(),
         })
         .collect()
 }
@@ -70,7 +72,13 @@ fn enter_submits_and_clears() {
     app.handle_key(key(KeyCode::Enter));
     assert!(app.input.is_empty());
     assert_eq!(app.cursor_position, 0);
-    assert_eq!(message_texts(&app), vec!["a"]);
+    assert_eq!(
+        message_texts(&app),
+        vec![
+            "a",
+            "llm not configured: set LITELLM_BASE_URL and LITELLM_MODEL (optional LITELLM_API_KEY)"
+        ]
+    );
 }
 
 #[test]
@@ -219,7 +227,20 @@ fn slash_unknown_shows_error() {
 fn normal_text_still_adds_to_messages() {
     let mut app = App::new();
     type_and_enter(&mut app, "hello");
-    assert_eq!(message_texts(&app), vec!["hello"]);
+    assert_eq!(
+        message_texts(&app),
+        vec![
+            "hello",
+            "llm not configured: set LITELLM_BASE_URL and LITELLM_MODEL (optional LITELLM_API_KEY)"
+        ]
+    );
+}
+
+#[test]
+fn prompt_without_llm_does_not_grow_chat_history() {
+    let mut app = App::new();
+    type_and_enter(&mut app, "hello");
+    assert!(app.chat_history.is_empty());
 }
 
 #[test]
@@ -863,4 +884,90 @@ fn teardown_inline_clears_viewport_and_resets_cursor() {
             );
         }
     }
+}
+
+#[tokio::test]
+async fn prompt_with_llm_appends_assistant_reply_and_history() {
+    use serde_json::json;
+    use sui_llm::{LlmClient, LlmConfig};
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path},
+    };
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "chatcmpl-1",
+            "object": "chat.completion",
+            "created": 1,
+            "model": "proxy-model",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "hello\nworld"
+                },
+                "finish_reason": "stop"
+            }]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let config = LlmConfig::new(server.uri(), "test-key", "proxy-model").expect("config");
+    let mut app = App::new().with_llm(LlmClient::new(&config));
+    type_and_enter(&mut app, "hi");
+
+    assert_eq!(message_texts(&app), vec!["hi", "hello", "world"]);
+    assert!(
+        matches!(
+            &app.messages[1..],
+            [ScrollbackLine::Reply(a), ScrollbackLine::Reply(b)]
+                if a == "hello" && b == "world"
+        ),
+        "expected reply lines, messages={:?}",
+        app.messages
+    );
+    assert_eq!(app.chat_history.len(), 2);
+    assert_eq!(app.chat_history[0].content, "hi");
+    assert_eq!(app.chat_history[1].content, "hello\nworld");
+}
+
+#[tokio::test]
+async fn prompt_llm_error_pops_failed_user_turn() {
+    use serde_json::json;
+    use sui_llm::{LlmClient, LlmConfig};
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path},
+    };
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(401).set_body_json(json!({
+            "error": {
+                "message": "invalid key",
+                "type": "auth_error",
+                "param": null,
+                "code": null
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let config = LlmConfig::new(server.uri(), "bad-key", "proxy-model").expect("config");
+    let mut app = App::new().with_llm(LlmClient::new(&config));
+    type_and_enter(&mut app, "hi");
+
+    assert!(app.chat_history.is_empty());
+    assert_eq!(message_texts(&app)[0], "hi");
+    assert!(
+        message_texts(&app)[1].starts_with("llm error:"),
+        "messages={:?}",
+        message_texts(&app)
+    );
 }

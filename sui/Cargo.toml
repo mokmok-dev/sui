@@ -8,6 +8,7 @@ version.workspace = true
 color-eyre = { workspace = true }
 ratatui = { workspace = true, features = ["crossterm"] }
 sui-app = { workspace = true }
+sui-llm = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 

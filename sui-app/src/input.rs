@@ -28,8 +28,8 @@ impl App {
                     let cmd = self.input[1..].to_owned();
                     self.handle_slash_command(&cmd);
                 } else {
-                    self.messages
-                        .push(crate::app::ScrollbackLine::Prompt(self.input.clone()));
+                    let prompt = self.input.clone();
+                    self.handle_chat_prompt(&prompt);
                 }
             },
         }
@@ -37,6 +37,41 @@ impl App {
         self.cursor_position = 0;
         self.slash_candidates.clear();
         self.slash_selected = 0;
+    }
+
+    /// Sends a user turn to the configured LLM and appends the reply as
+    /// [`crate::app::ScrollbackLine::Reply`] lines.
+    ///
+    /// Blocks the event loop until the Proxy responds or hits
+    /// [`crate::llm::DEFAULT_CHAT_TIMEOUT`]. Streaming is intentionally out of
+    /// scope for this sync TUI path.
+    pub(crate) fn handle_chat_prompt(
+        &mut self,
+        prompt: &str,
+    ) {
+        self.add_message(prompt);
+        let Some(client) = self.llm.clone() else {
+            self.add_message(
+                "llm not configured: set LITELLM_BASE_URL and LITELLM_MODEL (optional LITELLM_API_KEY)",
+            );
+            return;
+        };
+
+        self.chat_history
+            .push(sui_llm::ChatMessage::user(prompt.to_owned()));
+        match crate::llm::chat_blocking(&client, &self.chat_history) {
+            Ok(response) => {
+                self.chat_history
+                    .push(sui_llm::ChatMessage::assistant(response.content.clone()));
+                for line in response.content.lines() {
+                    self.add_reply(line);
+                }
+            },
+            Err(error) => {
+                let _ = self.chat_history.pop();
+                self.add_message(format!("llm error: {error}"));
+            },
+        }
     }
 
     /// Runs a one-shot shell command via [`crate::bang`].

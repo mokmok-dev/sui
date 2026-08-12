@@ -7,9 +7,15 @@ version.workspace = true
 [dependencies]
 crossterm = { workspace = true }
 ratatui = { workspace = true, features = ["crossterm"] }
+sui-llm = { workspace = true }
 sui-tools = { workspace = true }
 sui-widget = { workspace = true }
-tokio = { workspace = true, features = ["rt"] }
+tokio = { workspace = true, features = ["rt", "time"] }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }
+wiremock = { workspace = true }
 
 [lints]
 workspace = true
