@@ -504,7 +504,8 @@ impl App {
 
         let title = self.prompt_title_for_render();
         let prompt = PromptWidget::new(&self.input, self.cursor_position, &self.prompt_prefix)
-            .with_title(&title);
+            .with_title(&title)
+            .with_style(self.mode.border_style());
         let cursor_pos = prompt.screen_cursor(prompt_area);
         frame.render_widget(prompt, prompt_area);
         frame.set_cursor_position((cursor_pos.0, cursor_pos.1));

@@ -83,6 +83,16 @@ impl<'a> PromptWidget<'a> {
         self
     }
 
+    /// Sets the border style (e.g. foreground color per interaction mode).
+    #[must_use]
+    pub fn with_style(
+        mut self,
+        style: Style,
+    ) -> Self {
+        self.block = self.block.style(style);
+        self
+    }
+
     /// Block height (borders + wrapped content rows) for the given terminal width.
     #[must_use]
     pub fn block_height(
@@ -299,6 +309,17 @@ mod tests {
     #[test]
     fn with_title_preserves_cursor_math() {
         let widget = PromptWidget::new("hi", 2, "> ").with_title(" shell ");
+        let area = Rect::new(5, 2, 30, 3);
+        let (x, y) = widget.screen_cursor(area);
+        assert_eq!(x, 10);
+        assert_eq!(y, 3);
+    }
+
+    #[test]
+    fn with_style_does_not_affect_cursor_math() {
+        let widget = PromptWidget::new("hi", 2, "> ")
+            .with_title(" shell ")
+            .with_style(Style::default().fg(Color::Magenta));
         let area = Rect::new(5, 2, 30, 3);
         let (x, y) = widget.screen_cursor(area);
         assert_eq!(x, 10);
