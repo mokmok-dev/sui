@@ -41,7 +41,12 @@ fn chat_blocking_with_timeout(
             tokio::time::timeout(timeout, client.chat(&messages))
                 .await
                 .map_or_else(
-                    |_| Err(format!("llm request timed out after {}s", timeout.as_secs())),
+                    |_| {
+                        Err(format!(
+                            "llm request timed out after {}s",
+                            timeout.as_secs()
+                        ))
+                    },
                     |result| result.map_err(|error| error.to_string()),
                 )
         })
