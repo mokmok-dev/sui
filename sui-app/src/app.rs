@@ -5,12 +5,13 @@ use ratatui::{
     backend::{Backend, CrosstermBackend},
     layout::{Constraint, Layout, Position},
     style::{Modifier, Style},
+    text::{Line, Text},
     widgets::{Paragraph, Widget},
 };
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::Instant;
 use sui_llm::{ChatMessage, ChatResponse, LlmClient};
-use sui_widget::PromptWidget;
+use sui_widget::{PROMPT_MIN_HEIGHT, PromptWidget, wrap_prefixed, wrap_text};
 
 /// In-flight LLM chat: worker result channel + spinner clock.
 pub(crate) struct PendingLlm {
@@ -27,8 +28,8 @@ impl PendingLlm {
     }
 }
 
-/// Rows occupied by the bordered prompt widget.
-pub const PROMPT_HEIGHT: u16 = 3;
+/// Minimum rows occupied by the bordered prompt widget (single content line).
+pub const PROMPT_HEIGHT: u16 = PROMPT_MIN_HEIGHT;
 
 /// Extra inline rows reserved while the slash-suggestion panel is open.
 ///
@@ -224,16 +225,21 @@ impl App {
         self
     }
 
-    /// Inline viewport height for the current UI.
+    /// Inline viewport height for the current UI at the given terminal width.
     ///
-    /// Prompt-only while idle; expands by a fixed suggestion-panel budget when
-    /// any slash candidates are visible (avoids resizing on every keystroke).
+    /// Grows with wrapped prompt input and expands by a fixed suggestion-panel
+    /// budget when any slash candidates are visible (avoids resizing on every
+    /// keystroke).
     #[must_use]
-    pub const fn inline_height(&self) -> u16 {
+    pub fn inline_height(
+        &self,
+        width: u16,
+    ) -> u16 {
+        let prompt_height = PromptWidget::block_height(&self.input, &self.prompt_prefix, width);
         if self.slash_candidates.is_empty() {
-            PROMPT_HEIGHT
+            prompt_height
         } else {
-            PROMPT_HEIGHT.saturating_add(SUGGESTION_PANEL_HEIGHT)
+            prompt_height.saturating_add(SUGGESTION_PANEL_HEIGHT)
         }
     }
 
@@ -405,33 +411,44 @@ impl App {
         &mut self,
         terminal: &mut Terminal<B>,
     ) -> Result<(), B::Error> {
+        let width = terminal.get_frame().area().width;
         while self.flushed_messages < self.messages.len() {
             let line = &self.messages[self.flushed_messages];
             match line {
                 ScrollbackLine::Prompt(text) => {
-                    let rendered = format!("{}{text}", self.prompt_prefix);
-                    terminal.insert_before(1, move |buf| {
-                        Paragraph::new(rendered).render(buf.area, buf);
-                    })?;
+                    let rows = wrap_prefixed(text, &self.prompt_prefix, width as usize);
+                    Self::insert_wrapped_rows(terminal, rows, Style::default())?;
                 },
                 ScrollbackLine::Ghost(text) => {
-                    let rendered = text.clone();
-                    terminal.insert_before(1, move |buf| {
-                        Paragraph::new(rendered)
-                            .style(Style::default().add_modifier(Modifier::DIM))
-                            .render(buf.area, buf);
-                    })?;
+                    let rows = wrap_text(text, width as usize);
+                    Self::insert_wrapped_rows(
+                        terminal,
+                        rows,
+                        Style::default().add_modifier(Modifier::DIM),
+                    )?;
                 },
                 ScrollbackLine::Reply(text) => {
-                    let rendered = text.clone();
-                    terminal.insert_before(1, move |buf| {
-                        Paragraph::new(rendered).render(buf.area, buf);
-                    })?;
+                    let rows = wrap_text(text, width as usize);
+                    Self::insert_wrapped_rows(terminal, rows, Style::default())?;
                 },
             }
             self.flushed_messages += 1;
         }
         Ok(())
+    }
+
+    fn insert_wrapped_rows<B: Backend>(
+        terminal: &mut Terminal<B>,
+        rows: Vec<String>,
+        style: Style,
+    ) -> Result<(), B::Error> {
+        let height = u16::try_from(rows.len().max(1)).unwrap_or(u16::MAX);
+        terminal.insert_before(height, move |buf| {
+            let lines: Vec<Line<'_>> = rows.iter().map(|row| Line::from(row.as_str())).collect();
+            Paragraph::new(Text::from(lines))
+                .style(style)
+                .render(buf.area, buf);
+        })
     }
 
     /// Grows or shrinks the inline viewport to match [`App::inline_height`].
@@ -443,7 +460,8 @@ impl App {
         &mut self,
         terminal: &mut DefaultTerminal,
     ) -> std::io::Result<()> {
-        let height = self.inline_height();
+        let width = terminal.get_frame().area().width;
+        let height = self.inline_height(width);
         if height == self.viewport_height {
             return Ok(());
         }
@@ -468,6 +486,8 @@ impl App {
         frame: &mut Frame,
     ) {
         let area = frame.area();
+        let prompt_height =
+            PromptWidget::block_height(&self.input, &self.prompt_prefix, area.width);
 
         let suggestions_height = if self.slash_candidates.is_empty() {
             0
@@ -476,7 +496,7 @@ impl App {
         };
 
         let [prompt_area, suggestions_area, _reserved] = Layout::vertical([
-            Constraint::Length(PROMPT_HEIGHT),
+            Constraint::Length(prompt_height),
             Constraint::Length(suggestions_height),
             Constraint::Min(0),
         ])
