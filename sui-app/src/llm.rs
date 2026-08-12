@@ -14,6 +14,9 @@ use sui_llm::{ChatMessage, ChatResponse, LlmClient};
 /// Default deadline for a single streaming chat completion.
 pub const DEFAULT_CHAT_TIMEOUT: Duration = Duration::from_mins(2);
 
+/// Default deadline for a full agent turn (multiple samples + tools).
+pub const DEFAULT_AGENT_TIMEOUT: Duration = Duration::from_mins(10);
+
 /// Spinner frame interval while an LLM request is in flight.
 pub const SPINNER_TICK: Duration = Duration::from_millis(80);
 
@@ -22,10 +25,17 @@ const SPINNER_FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦
 
 /// Incremental update from the background chat worker.
 pub enum LlmStreamMsg {
-    /// A text delta from the Proxy stream.
+    /// A text delta from the Proxy stream (plain chat path).
     Chunk(String),
-    /// Stream finished successfully.
-    Done(ChatResponse),
+    /// A local tool finished; render as ghost scrollback.
+    Tool(String),
+    /// Stream / agent turn finished successfully.
+    Done {
+        /// Final assistant text for Markdown scrollback.
+        response: ChatResponse,
+        /// Full transcript to persist (includes tool calls / results).
+        history: Vec<ChatMessage>,
+    },
     /// Stream failed or timed out.
     Failed(String),
 }
@@ -95,7 +105,9 @@ fn chat_stream_spawn_with_timeout(
         })();
         match result {
             Ok(response) => {
-                let _ = tx.send(LlmStreamMsg::Done(response));
+                let mut history = messages;
+                history.push(ChatMessage::assistant(response.content.clone()));
+                let _ = tx.send(LlmStreamMsg::Done { response, history });
             },
             Err(error) => {
                 let _ = tx.send(LlmStreamMsg::Failed(error));
@@ -103,6 +115,91 @@ fn chat_stream_spawn_with_timeout(
         }
     });
     rx
+}
+
+/// Spawns the agent tool loop and returns a receiver for UI updates.
+///
+/// `messages` is the transcript *before* the new user turn. The worker appends
+/// the user message, runs tools, and returns the full history on success.
+#[must_use]
+pub fn agent_spawn(
+    client: &LlmClient,
+    tools: sui_tools::ToolRegistry,
+    messages: &[ChatMessage],
+    user: &str,
+) -> Receiver<LlmStreamMsg> {
+    agent_spawn_with_timeout(client, tools, messages, user, DEFAULT_AGENT_TIMEOUT)
+}
+
+fn agent_spawn_with_timeout(
+    client: &LlmClient,
+    tools: sui_tools::ToolRegistry,
+    messages: &[ChatMessage],
+    user: &str,
+    timeout: Duration,
+) -> Receiver<LlmStreamMsg> {
+    let (tx, rx) = mpsc::channel();
+    let client = client.clone();
+    let mut messages = messages.to_vec();
+    let user = user.to_owned();
+    let default_model = client.default_model().to_owned();
+    std::thread::spawn(move || {
+        let result = (|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| format!("failed to create tokio runtime: {error}"))?;
+            runtime.block_on(async {
+                tokio::time::timeout(timeout, async {
+                    let tx_tools = tx.clone();
+                    let text = sui_agent::run_turn(
+                        &client,
+                        &tools,
+                        &mut messages,
+                        user,
+                        sui_agent::TurnOptions::default(),
+                        |event| {
+                            if let sui_agent::AgentEvent::ToolEnd { name, result, .. } = event {
+                                let line = format_tool_line(&name, &result);
+                                let _ = tx_tools.send(LlmStreamMsg::Tool(line));
+                            }
+                        },
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
+                    if !text.is_empty() {
+                        let _ = tx.send(LlmStreamMsg::Chunk(text.clone()));
+                    }
+                    Ok((ChatResponse::new(text, &default_model), messages))
+                })
+                .await
+                .unwrap_or_else(|_| {
+                    Err(format!("agent turn timed out after {}s", timeout.as_secs()))
+                })
+            })
+        })();
+        match result {
+            Ok((response, history)) => {
+                let _ = tx.send(LlmStreamMsg::Done { response, history });
+            },
+            Err(error) => {
+                let _ = tx.send(LlmStreamMsg::Failed(error));
+            },
+        }
+    });
+    rx
+}
+
+fn format_tool_line(
+    name: &str,
+    result: &str,
+) -> String {
+    let preview: String = result.chars().take(120).collect();
+    if result.chars().count() > 120 {
+        format!("tool {name}: {preview}…")
+    } else {
+        format!("tool {name}: {preview}")
+    }
 }
 
 #[cfg(test)]

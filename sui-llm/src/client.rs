@@ -4,28 +4,33 @@ use async_openai::{
     Client,
     config::OpenAIConfig,
     types::chat::{
-        ChatCompletionRequestAssistantMessageContent, ChatCompletionRequestMessage,
-        ChatCompletionRequestSystemMessageContent, ChatCompletionRequestUserMessageContent,
-        CreateChatCompletionRequestArgs, CreateChatCompletionStreamResponse,
+        ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls,
+        ChatCompletionRequestAssistantMessage, ChatCompletionRequestAssistantMessageContent,
+        ChatCompletionRequestMessage, ChatCompletionRequestSystemMessageContent,
+        ChatCompletionRequestToolMessage, ChatCompletionRequestUserMessageContent,
+        ChatCompletionTool, ChatCompletionTools, CreateChatCompletionRequestArgs,
+        CreateChatCompletionStreamResponse, FunctionCall, FunctionObject,
     },
 };
 
 use futures::{Stream, StreamExt};
 
-use crate::{ChatMessage, LlmConfig, LlmError, Role};
+use crate::{ChatMessage, LlmConfig, LlmError, Role, ToolCall, ToolSpec};
 
 /// Successful non-streaming chat completion.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ChatResponse {
-    /// Assistant text from the first choice.
+    /// Assistant text from the first choice (empty when the model only calls tools).
     pub content: String,
     /// Model id returned by the Proxy.
     pub model: String,
+    /// Function calls the client must execute before the next sample.
+    pub tool_calls: Vec<ToolCall>,
 }
 
 impl ChatResponse {
-    /// Builds a response from assistant text and the Proxy model id.
+    /// Builds a text-only response from assistant text and the Proxy model id.
     #[must_use]
     pub fn new(
         content: impl Into<String>,
@@ -34,7 +39,18 @@ impl ChatResponse {
         Self {
             content: content.into(),
             model: model.into(),
+            tool_calls: Vec::new(),
         }
+    }
+
+    /// Attaches tool calls to this response.
+    #[must_use]
+    pub fn with_tool_calls(
+        mut self,
+        tool_calls: Vec<ToolCall>,
+    ) -> Self {
+        self.tool_calls = tool_calls;
+        self
     }
 }
 
@@ -128,7 +144,7 @@ impl LlmClient {
         &self,
         messages: &[ChatMessage],
     ) -> Result<ChatResponse, LlmError> {
-        self.chat_with_model(&self.default_model, messages).await
+        self.complete(&self.default_model, messages, &[]).await
     }
 
     /// Non-streaming chat with an explicit logical model name.
@@ -143,23 +159,60 @@ impl LlmClient {
         model: &str,
         messages: &[ChatMessage],
     ) -> Result<ChatResponse, LlmError> {
+        self.complete(model, messages, &[]).await
+    }
+
+    /// Non-streaming chat that advertises `tools` to the model.
+    ///
+    /// When the model returns [`ChatResponse::tool_calls`], the caller must
+    /// execute them locally, append [`ChatMessage::assistant_tools`] plus
+    /// [`ChatMessage::tool`] results, and sample again. An empty `tools` slice
+    /// omits the `tools` request field (same as [`Self::chat`]).
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::chat`]. Empty assistant text is allowed when
+    /// `tool_calls` is non-empty.
+    pub async fn chat_with_tools(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[ToolSpec],
+    ) -> Result<ChatResponse, LlmError> {
+        self.complete(&self.default_model, messages, tools).await
+    }
+
+    /// Non-streaming chat with an explicit model and advertised tools.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::chat_with_tools`], plus [`LlmError::InvalidArgument`]
+    /// for an empty/whitespace model.
+    pub async fn chat_with_model_and_tools(
+        &self,
+        model: &str,
+        messages: &[ChatMessage],
+        tools: &[ToolSpec],
+    ) -> Result<ChatResponse, LlmError> {
+        self.complete(model, messages, tools).await
+    }
+
+    async fn complete(
+        &self,
+        model: &str,
+        messages: &[ChatMessage],
+        tools: &[ToolSpec],
+    ) -> Result<ChatResponse, LlmError> {
         let model = require_model_argument(model)?;
         require_non_empty_messages(messages)?;
-        let request = CreateChatCompletionRequestArgs::default()
-            .model(model)
-            .messages(to_openai_messages(messages))
-            .build()?;
+        let mut request = CreateChatCompletionRequestArgs::default();
+        request.model(model).messages(to_openai_messages(messages));
+        if !tools.is_empty() {
+            request.tools(to_openai_tools(tools));
+        }
+        let request = request.build()?;
 
         let response = self.inner.chat().create(request).await?;
         let choice = response.choices.first().ok_or(LlmError::EmptyResponse)?;
-        if let Some(content) = choice
-            .message
-            .content
-            .as_deref()
-            .filter(|text| !text.is_empty())
-        {
-            return Ok(ChatResponse::new(content, response.model));
-        }
         if let Some(refusal) = choice
             .message
             .refusal
@@ -168,7 +221,16 @@ impl LlmClient {
         {
             return Err(LlmError::Refused(refusal.to_owned()));
         }
-        Err(LlmError::EmptyResponse)
+        let tool_calls = map_tool_calls(choice.message.tool_calls.as_ref());
+        let content = choice.message.content.as_deref().unwrap_or("").to_owned();
+        if content.is_empty() && tool_calls.is_empty() {
+            return Err(LlmError::EmptyResponse);
+        }
+        Ok(ChatResponse {
+            content,
+            model: response.model,
+            tool_calls,
+        })
     }
 
     /// Streaming chat using the configured default model.
@@ -264,18 +326,81 @@ fn map_stream_item(
 }
 
 fn to_openai_messages(messages: &[ChatMessage]) -> Vec<ChatCompletionRequestMessage> {
-    messages
+    messages.iter().map(to_openai_message).collect()
+}
+
+fn to_openai_message(message: &ChatMessage) -> ChatCompletionRequestMessage {
+    match message.role {
+        Role::System => ChatCompletionRequestMessage::System(
+            ChatCompletionRequestSystemMessageContent::Text(message.content.clone()).into(),
+        ),
+        Role::User => ChatCompletionRequestMessage::User(
+            ChatCompletionRequestUserMessageContent::Text(message.content.clone()).into(),
+        ),
+        Role::Assistant => ChatCompletionRequestMessage::Assistant({
+            let mut assistant = ChatCompletionRequestAssistantMessage::default();
+            if !message.content.is_empty() {
+                assistant.content = Some(ChatCompletionRequestAssistantMessageContent::Text(
+                    message.content.clone(),
+                ));
+            }
+            if !message.tool_calls.is_empty() {
+                assistant.tool_calls = Some(
+                    message
+                        .tool_calls
+                        .iter()
+                        .map(|call| {
+                            ChatCompletionMessageToolCalls::Function(
+                                ChatCompletionMessageToolCall {
+                                    id: call.id.clone(),
+                                    function: FunctionCall {
+                                        name: call.name.clone(),
+                                        arguments: call.arguments.clone(),
+                                    },
+                                },
+                            )
+                        })
+                        .collect(),
+                );
+            }
+            assistant
+        }),
+        Role::Tool => ChatCompletionRequestMessage::Tool(ChatCompletionRequestToolMessage {
+            content: message.content.clone().into(),
+            tool_call_id: message.tool_call_id.clone().unwrap_or_default(),
+        }),
+    }
+}
+
+fn to_openai_tools(tools: &[ToolSpec]) -> Vec<ChatCompletionTools> {
+    tools
         .iter()
-        .map(|message| match message.role {
-            Role::System => ChatCompletionRequestMessage::System(
-                ChatCompletionRequestSystemMessageContent::Text(message.content.clone()).into(),
-            ),
-            Role::User => ChatCompletionRequestMessage::User(
-                ChatCompletionRequestUserMessageContent::Text(message.content.clone()).into(),
-            ),
-            Role::Assistant => ChatCompletionRequestMessage::Assistant(
-                ChatCompletionRequestAssistantMessageContent::Text(message.content.clone()).into(),
-            ),
+        .map(|tool| {
+            ChatCompletionTools::Function(ChatCompletionTool {
+                function: FunctionObject {
+                    name: tool.name.clone(),
+                    description: Some(tool.description.clone()),
+                    parameters: Some(tool.parameters.clone()),
+                    strict: None,
+                },
+            })
+        })
+        .collect()
+}
+
+fn map_tool_calls(calls: Option<&Vec<ChatCompletionMessageToolCalls>>) -> Vec<ToolCall> {
+    let Some(calls) = calls else {
+        return Vec::new();
+    };
+    calls
+        .iter()
+        .filter_map(|call| match call {
+            ChatCompletionMessageToolCalls::Function(function) => Some(ToolCall::new(
+                function.id.clone(),
+                function.function.name.clone(),
+                function.function.arguments.clone(),
+            )),
+            ChatCompletionMessageToolCalls::Custom(_) => None,
         })
         .collect()
 }
@@ -292,6 +417,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::{ChatMessage, ToolCall, ToolSpec};
 
     fn client_for(
         server: &MockServer,
@@ -749,5 +875,136 @@ mod tests {
         assert!(!err.to_string().contains("secret-body"));
         assert!(!format!("{err:?}").contains("secret-body"));
         assert!(err.source().is_some());
+    }
+
+    fn echo_tool() -> ToolSpec {
+        ToolSpec::new(
+            "echo",
+            "Echo a string back",
+            json!({
+                "type": "object",
+                "properties": {
+                    "text": { "type": "string" }
+                },
+                "required": ["text"],
+                "additionalProperties": false
+            }),
+        )
+    }
+
+    #[tokio::test]
+    async fn chat_with_tools_parses_tool_calls_and_allows_empty_content() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_partial_json(json!({
+                "tools": [{
+                    "function": { "name": "echo" }
+                }]
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "chatcmpl-tools",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "proxy-model",
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": null,
+                        "tool_calls": [{
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "echo",
+                                "arguments": "{\"text\":\"hi\"}"
+                            }
+                        }]
+                    },
+                    "finish_reason": "tool_calls"
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server, "proxy-model");
+        let response = client
+            .chat_with_tools(&[ChatMessage::user("hi")], &[echo_tool()])
+            .await
+            .expect("chat");
+        assert!(response.content.is_empty());
+        assert_eq!(response.tool_calls.len(), 1);
+        assert_eq!(response.tool_calls[0].id, "call_1");
+        assert_eq!(response.tool_calls[0].name, "echo");
+        assert_eq!(response.tool_calls[0].arguments, "{\"text\":\"hi\"}");
+    }
+
+    #[tokio::test]
+    async fn chat_with_tools_roundtrips_tool_result_messages() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_partial_json(json!({
+                "messages": [
+                    { "role": "user", "content": "hi" },
+                    {
+                        "role": "assistant",
+                        "tool_calls": [{
+                            "id": "call_1",
+                            "function": {
+                                "name": "echo",
+                                "arguments": "{\"text\":\"hi\"}"
+                            }
+                        }]
+                    },
+                    {
+                        "role": "tool",
+                        "tool_call_id": "call_1",
+                        "content": "{\"ok\":true}"
+                    }
+                ]
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok_completion("echoed")))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server, "proxy-model");
+        let response = client
+            .chat_with_tools(
+                &[
+                    ChatMessage::user("hi"),
+                    ChatMessage::assistant_tools(
+                        "",
+                        vec![ToolCall::new("call_1", "echo", "{\"text\":\"hi\"}")],
+                    ),
+                    ChatMessage::tool("call_1", "{\"ok\":true}"),
+                ],
+                &[echo_tool()],
+            )
+            .await
+            .expect("chat");
+        assert_eq!(response.content, "echoed");
+        assert!(response.tool_calls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn chat_omits_tools_field_when_none_are_advertised() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok_completion("ok")))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server, "proxy-model");
+        let response = client.chat(&[ChatMessage::user("hi")]).await.expect("chat");
+        assert_eq!(response.content, "ok");
+
+        let requests = server.received_requests().await.expect("requests");
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).expect("json");
+        assert!(body.get("tools").is_none(), "{body}");
     }
 }

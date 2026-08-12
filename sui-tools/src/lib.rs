@@ -41,5 +41,5 @@ pub use error::ToolsError;
 pub use tantivy_index::TantivyIndex;
 pub use tool::{
     BashTool, CodeSearchTool, MAX_SEARCH_LIMIT, Tool, ToolFuture, ToolRegistry, builtin_registry,
-    code_search_registry,
+    code_search_registry, coding_registry,
 };

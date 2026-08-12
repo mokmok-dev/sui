@@ -7,20 +7,86 @@ pub enum Role {
     User,
     /// Prior assistant turn.
     Assistant,
+    /// Tool result answering a previous [`ToolCall`].
+    Tool,
 }
 
-/// A single text chat message.
+/// A model-emitted function call (`OpenAI` `tool_calls` item).
 ///
-/// Prefer [`ChatMessage::system`], [`ChatMessage::user`], and
-/// [`ChatMessage::assistant`] over struct literals so new fields remain
+/// `arguments` is the raw JSON object string from the model so it can be
+/// echoed back on the next request without re-serialization drift.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ToolCall {
+    /// Provider-assigned call id (`call_…`); required on the tool-result turn.
+    pub id: String,
+    /// Registered tool name.
+    pub name: String,
+    /// JSON object payload as emitted by the model.
+    pub arguments: String,
+}
+
+impl ToolCall {
+    /// Builds a tool call from id, name, and raw JSON arguments.
+    #[must_use]
+    pub fn new(
+        id: impl Into<String>,
+        name: impl Into<String>,
+        arguments: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            name: name.into(),
+            arguments: arguments.into(),
+        }
+    }
+}
+
+/// JSON-Schema tool advertised to the model on a chat request.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct ToolSpec {
+    /// Stable tool name the model must use in [`ToolCall::name`].
+    pub name: String,
+    /// When and how to use the tool (shown to the model).
+    pub description: String,
+    /// JSON Schema object for the tool's arguments (`type: object`).
+    pub parameters: serde_json::Value,
+}
+
+impl ToolSpec {
+    /// Builds a tool spec from name, description, and a JSON Schema object.
+    #[must_use]
+    pub fn new(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        parameters: serde_json::Value,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            description: description.into(),
+            parameters,
+        }
+    }
+}
+
+/// A single chat message.
+///
+/// Prefer the constructors ([`ChatMessage::system`], [`ChatMessage::user`],
+/// [`ChatMessage::assistant`], [`ChatMessage::assistant_tools`],
+/// [`ChatMessage::tool`]) over struct literals so new fields remain
 /// non-breaking (`#[non_exhaustive]` rejects crate-external literals).
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ChatMessage {
     /// Who authored the message.
     pub role: Role,
-    /// Plain-text content.
+    /// Plain-text content (empty on assistant turns that only call tools).
     pub content: String,
+    /// Assistant-emitted tool calls (empty unless [`Role::Assistant`]).
+    pub tool_calls: Vec<ToolCall>,
+    /// Id of the tool call this result answers ([`Role::Tool`] only).
+    pub tool_call_id: Option<String>,
 }
 
 impl ChatMessage {
@@ -30,6 +96,8 @@ impl ChatMessage {
         Self {
             role: Role::System,
             content: content.into(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
         }
     }
 
@@ -39,15 +107,47 @@ impl ChatMessage {
         Self {
             role: Role::User,
             content: content.into(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
         }
     }
 
-    /// Builds an assistant message.
+    /// Builds an assistant text message (no tool calls).
     #[must_use]
     pub fn assistant(content: impl Into<String>) -> Self {
         Self {
             role: Role::Assistant,
             content: content.into(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        }
+    }
+
+    /// Builds an assistant turn that requested tools.
+    #[must_use]
+    pub fn assistant_tools(
+        content: impl Into<String>,
+        tool_calls: Vec<ToolCall>,
+    ) -> Self {
+        Self {
+            role: Role::Assistant,
+            content: content.into(),
+            tool_calls,
+            tool_call_id: None,
+        }
+    }
+
+    /// Builds a tool-result message for `tool_call_id`.
+    #[must_use]
+    pub fn tool(
+        tool_call_id: impl Into<String>,
+        content: impl Into<String>,
+    ) -> Self {
+        Self {
+            role: Role::Tool,
+            content: content.into(),
+            tool_calls: Vec::new(),
+            tool_call_id: Some(tool_call_id.into()),
         }
     }
 }

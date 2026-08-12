@@ -10,6 +10,7 @@ codewandler-markdown-ratatui = { workspace = true }
 crossterm = { workspace = true }
 futures = { workspace = true }
 ratatui = { workspace = true, features = ["crossterm", "scrolling-regions"] }
+sui-agent = { workspace = true }
 sui-llm = { workspace = true }
 sui-tools = { workspace = true }
 sui-widget = { workspace = true }

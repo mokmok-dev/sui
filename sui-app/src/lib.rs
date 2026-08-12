@@ -15,14 +15,18 @@
 //!   `@` anywhere suggests files; Enter/Tab inserts the relative path). While a
 //!   chat request is in flight the prompt border shows a working spinner,
 //!   assistant Markdown streams above the prompt, and further chat submits are
-//!   deferred until the stream completes (Ctrl-C / Esc still quit).
+//!   deferred until the stream completes (Ctrl-C / Esc still quit). When
+//!   [`App::with_tools`] is set, prompt submits run the agent tool loop
+//!   (`sui-agent`) instead of a single completion; tool results appear as ghost
+//!   lines.
 //! - [`Mode::Shell`] — entered with `!` on an empty prompt; Enter runs bash
 //!   via [`sui_tools::run_line`], then returns to [`Mode::Prompt`]; Esc cancels
 //!   back to Prompt without running; output is flushed as dim ghost text
 //!
 //! Attach a client with [`App::with_llm`] (typically
-//! [`sui_llm::LlmClient::from_env`] in the binary). Without a client, prompt
-//! submits report a configuration error instead of calling the Proxy.
+//! [`sui_llm::LlmClient::from_env`] in the binary) and tools with
+//! [`App::with_tools`]. Without a client, prompt submits report a configuration
+//! error instead of calling the Proxy.
 //!
 //! Future surfaces (subagent, workflow) should add [`Mode`] variants rather
 //! than new prefix heuristics.

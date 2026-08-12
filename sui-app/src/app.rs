@@ -98,7 +98,9 @@ pub struct App {
     pub(crate) file_cache: Option<Vec<String>>,
     /// Optional `LiteLLM` Proxy client for [`Mode::Prompt`] chat.
     pub(crate) llm: Option<LlmClient>,
-    /// Session chat turns sent to the Proxy (user + assistant only).
+    /// Tools advertised to the model when set ([`App::with_tools`]).
+    pub(crate) tools: Option<sui_tools::ToolRegistry>,
+    /// Session chat turns sent to the Proxy (user + assistant + tool results).
     pub(crate) chat_history: Vec<ChatMessage>,
     /// Active LLM request (event loop polls; spinner animates until it lands).
     pub(crate) pending_llm: Option<PendingLlm>,
@@ -132,6 +134,7 @@ impl App {
             at_selected: 0,
             file_cache: None,
             llm: None,
+            tools: None,
             chat_history: Vec::new(),
             pending_llm: None,
             streaming_reply: None,
@@ -149,6 +152,19 @@ impl App {
         client: LlmClient,
     ) -> Self {
         self.llm = Some(client);
+        self
+    }
+
+    /// Attach a tool registry so prompt-mode chat runs the agent loop.
+    ///
+    /// Without this, prompt submits are plain chat (no function calling).
+    /// Typical wiring: [`sui_tools::coding_registry`] over the workspace.
+    #[must_use]
+    pub fn with_tools(
+        mut self,
+        tools: sui_tools::ToolRegistry,
+    ) -> Self {
+        self.tools = Some(tools);
         self
     }
 
@@ -371,24 +387,6 @@ impl App {
         Ok(())
     }
 
-    /// Applies a completed chat result to history / scrollback.
-    pub(crate) fn apply_chat_result(
-        &mut self,
-        result: Result<ChatResponse, String>,
-    ) {
-        match result {
-            Ok(response) => {
-                self.chat_history
-                    .push(sui_llm::ChatMessage::assistant(response.content.clone()));
-                self.add_reply(response.content);
-            },
-            Err(error) => {
-                let _ = self.chat_history.pop();
-                self.add_message(format!("llm error: {error}"));
-            },
-        }
-    }
-
     fn ensure_streaming_reply(&mut self) -> &mut StreamingMarkdown {
         self.streaming_reply
             .get_or_insert_with(StreamingMarkdown::new)
@@ -401,16 +399,13 @@ impl App {
     fn finish_streaming_reply(
         &mut self,
         response: ChatResponse,
+        history: Vec<ChatMessage>,
     ) {
+        self.chat_history = history;
         if let Some(mut streaming) = self.streaming_reply.take() {
             streaming.finish();
-            let content = response.content;
-            self.chat_history
-                .push(sui_llm::ChatMessage::assistant(content.clone()));
-            self.add_reply(content);
-        } else {
-            self.apply_chat_result(Ok(response));
         }
+        self.add_reply(response.content);
     }
 
     /// Returns `true` when the stream is finished and [`Self::pending_llm`]
@@ -425,13 +420,16 @@ impl App {
                 self.ensure_streaming_reply().push_delta(&delta);
                 false
             },
-            LlmStreamMsg::Done(response) => {
-                self.finish_streaming_reply(response);
+            LlmStreamMsg::Tool(line) => {
+                self.add_ghost(line);
+                false
+            },
+            LlmStreamMsg::Done { response, history } => {
+                self.finish_streaming_reply(response, history);
                 true
             },
             LlmStreamMsg::Failed(error) => {
                 self.clear_streaming_reply();
-                let _ = self.chat_history.pop();
                 self.add_message(format!("llm error: {error}"));
                 true
             },
@@ -465,7 +463,6 @@ impl App {
     pub(crate) fn abandon_pending_llm(&mut self) {
         if self.pending_llm.take().is_some() {
             self.clear_streaming_reply();
-            let _ = self.chat_history.pop();
         }
     }
 
