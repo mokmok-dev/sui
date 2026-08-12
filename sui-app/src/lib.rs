@@ -13,7 +13,8 @@
 //! - [`Mode::Prompt`] (default) — chat via optional [`sui_llm::LlmClient`];
 //!   `/` opens slash commands. While a chat request is in flight the prompt
 //!   border shows a working spinner, assistant Markdown streams above the
-//!   prompt, and further input is ignored (Ctrl-C / Esc still quit).
+//!   prompt, and further chat submits are deferred until the stream completes
+//!   (Ctrl-C / Esc still quit).
 //! - [`Mode::Shell`] — entered with `!` on an empty prompt; Enter runs bash
 //!   via [`sui_tools::run_line`], then returns to [`Mode::Prompt`]; Esc cancels
 //!   back to Prompt without running; output is flushed as dim ghost text

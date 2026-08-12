@@ -765,6 +765,24 @@ fn inline_height_grows_with_slash_candidates() {
     assert_eq!(app.inline_height(80), PROMPT_HEIGHT);
 }
 
+
+fn visible_row(backend: &TestBackend, y: u16) -> String {
+    use ratatui::buffer::CellWidth;
+    let area = backend.buffer().area;
+    let mut out = String::new();
+    let mut x = 0u16;
+    while x < area.width {
+        let cell = &backend.buffer()[(x, y)];
+        let w = cell.cell_width().max(1);
+        let sym = cell.symbol();
+        if sym != " " {
+            out.push_str(sym);
+        }
+        x = x.saturating_add(w);
+    }
+    out.trim_end().to_string()
+}
+
 fn infallible<T>(result: Result<T, core::convert::Infallible>) -> T {
     match result {
         Ok(value) => value,
@@ -1021,7 +1039,7 @@ async fn prompt_llm_error_pops_failed_user_turn() {
 }
 
 #[tokio::test]
-async fn prompt_llm_waiting_shows_spinner_and_ignores_input() {
+async fn prompt_llm_waiting_shows_spinner_and_allows_typing() {
     use serde_json::json;
     use std::time::Duration;
     use sui_llm::{LlmClient, LlmConfig};
@@ -1061,8 +1079,12 @@ async fn prompt_llm_waiting_shows_spinner_and_ignores_input() {
     );
 
     app.handle_key(key_char('x'));
-    assert!(app.input.is_empty(), "input must be ignored while waiting");
+    assert_eq!(app.input, "x", "typing must work while waiting");
     assert!(!app.should_quit);
+
+    app.handle_key(key(KeyCode::Enter));
+    assert_eq!(app.input, "x", "enter must not submit while waiting");
+    assert!(app.pending_llm.is_some());
 
     app.handle_key(ctrl_key('c'));
     assert!(app.should_quit);
@@ -1073,4 +1095,47 @@ async fn prompt_llm_waiting_shows_spinner_and_ignores_input() {
     );
     // Worker may still finish; we abandoned the receiver so no reply is applied.
     assert_eq!(message_texts(&app), vec!["hi"]);
+}
+
+#[test]
+fn flush_japanese_prompt_renders_without_spurious_gaps() {
+    let mut terminal = inline_test_terminal(40, 10, 4);
+    let mut app = App::new();
+    app.add_message("こんにちは！");
+    infallible(app.flush_messages(&mut terminal));
+
+    let backend = terminal.backend();
+    let line = visible_row(backend, 4);
+    assert!(
+        !line.contains("こ ん"),
+        "CJK must not have spaces between chars: {line:?}"
+    );
+    assert!(line.contains("こんにちは"), "expected intact Japanese: {line:?}");
+}
+
+#[test]
+fn render_japanese_streaming_without_spurious_gaps() {
+    use crate::markdown::StreamingMarkdown;
+    use ratatui::{
+        Terminal, backend::TestBackend, widgets::{Paragraph, Widget},
+    };
+
+    let mut stream = StreamingMarkdown::new();
+    stream.push_delta("こんにちは！");
+    stream.finish();
+
+    let terminal = TestBackend::new(40, 5);
+    let mut term = Terminal::new(terminal).unwrap();
+    term.draw(|frame| {
+        let text = ratatui::text::Text::from(stream.render_lines(40));
+        Paragraph::new(text).render(frame.area(), frame.buffer_mut());
+    })
+    .unwrap();
+
+    let backend = term.backend();
+    let row = visible_row(backend, 0);
+    assert!(
+        !row.contains("こ ん"),
+        "streaming CJK must not have gaps: {row:?}"
+    );
 }
