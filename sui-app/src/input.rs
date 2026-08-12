@@ -102,21 +102,22 @@ impl App {
         &mut self,
         key: KeyEvent,
     ) {
-        // While waiting on the LLM, only allow quit — ignore further input so
-        // a second prompt cannot race the in-flight request.
+        // Quit shortcuts still abandon an in-flight request so history stays paired.
         if self.pending_llm.is_some() {
             match key.code {
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     self.abandon_pending_llm();
                     self.should_quit = true;
+                    return;
                 },
                 KeyCode::Esc => {
                     self.abandon_pending_llm();
                     self.should_quit = true;
+                    return;
                 },
+                KeyCode::Enter => return,
                 _ => {},
             }
-            return;
         }
 
         match key.code {
