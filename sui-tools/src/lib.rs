@@ -35,6 +35,7 @@ pub use bm25::{
     Bm25Index, DEFAULT_B, DEFAULT_K1, LexicalSearch, MAX_FILE_BYTES, MAX_INDEX_DOCS, SNIPPET_CHARS,
     SearchHit, tokenize,
 };
+pub use corpus::list_workspace_files;
 pub use edit::{EditTool, SearchReplaceBlock, apply_blocks, parse_search_replace_blocks};
 pub use error::ToolsError;
 pub use tantivy_index::TantivyIndex;
