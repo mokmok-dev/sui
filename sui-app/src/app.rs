@@ -180,14 +180,21 @@ impl App {
     /// This is the preferred entry point: no alternate screen, prompt-only
     /// viewport, scrollback via [`App::flush_messages`].
     ///
+    /// On exit only raw mode is disabled. [`ratatui::restore`] is intentionally
+    /// not used: it always emits `LeaveAlternateScreen` (`CSI ?1049l`), and many
+    /// terminals treat that as “restore cursor” even when the app never entered
+    /// the alternate buffer — yanking the cursor above `insert_before`
+    /// scrollback (including shell ghost lines).
+    ///
     /// # Errors
-    /// Returns an I/O error if terminal setup, the run loop, or restore fails.
+    /// Returns an I/O error if terminal setup or the run loop fails. Raw-mode
+    /// cleanup is best-effort and does not override a successful run result.
     pub fn run_inline(&mut self) -> std::io::Result<()> {
         let mut terminal = ratatui::try_init_with_options(TerminalOptions {
             viewport: Viewport::Inline(PROMPT_HEIGHT),
         })?;
         let result = self.run(&mut terminal);
-        ratatui::restore();
+        let _ = crossterm::terminal::disable_raw_mode();
         result
     }
 
@@ -196,8 +203,13 @@ impl App {
     /// Prefer [`App::run_inline`] unless you already own an inline
     /// [`ratatui::Viewport`] terminal whose height starts at [`PROMPT_HEIGHT`].
     ///
-    /// On exit the inline viewport is cleared and the cursor is moved to its
-    /// origin so the shell prompt does not overlap leftover TUI cells.
+    /// On exit any pending scrollback (including ghost lines) is flushed, the
+    /// inline viewport is cleared, and the cursor is moved to the viewport
+    /// origin so the host shell prompt sits just below that output.
+    ///
+    /// Callers that set up the terminal themselves should disable raw mode
+    /// after this returns and **must not** call [`ratatui::restore`] (it emits
+    /// `LeaveAlternateScreen`, which can reset the cursor above the scrollback).
     ///
     /// # Errors
     /// Returns an I/O error if terminal operations or event reading fail.
@@ -206,7 +218,9 @@ impl App {
         terminal: &mut DefaultTerminal,
     ) -> std::io::Result<()> {
         let result = self.event_loop(terminal);
-        // Always tear down so Esc/`/exit` leave a clean normal-screen cursor.
+        // Commit any lines queued by the final event (e.g. bang ghosts) before
+        // parking the cursor — otherwise teardown uses a stale viewport origin.
+        let _ = self.flush_messages(terminal);
         let _ = Self::teardown_inline(terminal);
         result
     }
