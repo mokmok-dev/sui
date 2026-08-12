@@ -10,10 +10,15 @@
 //! # Modes
 //!
 //! Interaction uses explicit [`Mode`] state, not input-prefix inference:
-//! - [`Mode::Prompt`] (default) — chat text; `/` opens slash commands
+//! - [`Mode::Prompt`] (default) — chat via optional [`sui_llm::LlmClient`];
+//!   `/` opens slash commands
 //! - [`Mode::Shell`] — entered with `!` on an empty prompt; Enter runs bash
 //!   via [`sui_tools::run_line`], then returns to [`Mode::Prompt`]; Esc cancels
 //!   back to Prompt without running; output is flushed as dim ghost text
+//!
+//! Attach a client with [`App::with_llm`] (typically
+//! [`sui_llm::LlmClient::from_env`] in the binary). Without a client, prompt
+//! submits report a configuration error instead of calling the Proxy.
 //!
 //! Future surfaces (subagent, workflow) should add [`Mode`] variants rather
 //! than new prefix heuristics.
@@ -21,6 +26,7 @@
 pub mod app;
 pub(crate) mod bang;
 pub mod input;
+pub(crate) mod llm;
 pub mod mode;
 pub mod slash;
 

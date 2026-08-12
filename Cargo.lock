@@ -2567,6 +2567,7 @@ dependencies = [
  "color-eyre",
  "ratatui",
  "sui-app",
+ "sui-llm",
  "thiserror",
  "tokio",
 ]
@@ -2577,9 +2578,12 @@ version = "0.0.0"
 dependencies = [
  "crossterm",
  "ratatui",
+ "serde_json",
+ "sui-llm",
  "sui-tools",
  "sui-widget",
  "tokio",
+ "wiremock",
 ]
 
 [[package]]
