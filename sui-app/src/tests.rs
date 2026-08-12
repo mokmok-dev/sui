@@ -765,8 +765,10 @@ fn inline_height_grows_with_slash_candidates() {
     assert_eq!(app.inline_height(80), PROMPT_HEIGHT);
 }
 
-
-fn visible_row(backend: &TestBackend, y: u16) -> String {
+fn visible_row(
+    backend: &TestBackend,
+    y: u16,
+) -> String {
     use ratatui::buffer::CellWidth;
     let area = backend.buffer().area;
     let mut out = String::new();
@@ -1110,14 +1112,19 @@ fn flush_japanese_prompt_renders_without_spurious_gaps() {
         !line.contains("こ ん"),
         "CJK must not have spaces between chars: {line:?}"
     );
-    assert!(line.contains("こんにちは"), "expected intact Japanese: {line:?}");
+    assert!(
+        line.contains("こんにちは"),
+        "expected intact Japanese: {line:?}"
+    );
 }
 
 #[test]
 fn render_japanese_streaming_without_spurious_gaps() {
     use crate::markdown::StreamingMarkdown;
     use ratatui::{
-        Terminal, backend::TestBackend, widgets::{Paragraph, Widget},
+        Terminal,
+        backend::TestBackend,
+        widgets::{Paragraph, Widget},
     };
 
     let mut stream = StreamingMarkdown::new();
