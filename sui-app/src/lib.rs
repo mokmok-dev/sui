@@ -9,12 +9,12 @@
 //!
 //! # Modes
 //!
-//! Interaction is sticky [`Mode`] state (vim-like), not inferred from prefixes:
+//! Interaction uses explicit [`Mode`] state, not input-prefix inference:
 //! - [`Mode::Prompt`] (default) — chat via optional [`sui_llm::LlmClient`];
 //!   `/` opens slash commands
 //! - [`Mode::Shell`] — entered with `!` on an empty prompt; Enter runs bash
-//!   via [`sui_tools::run_line`]; Esc returns to [`Mode::Prompt`]; output is
-//!   flushed as dim ghost text (no prompt prefix)
+//!   via [`sui_tools::run_line`], then returns to [`Mode::Prompt`]; Esc cancels
+//!   back to Prompt without running; output is flushed as dim ghost text
 //!
 //! Attach a client with [`App::with_llm`] (typically
 //! [`sui_llm::LlmClient::from_env`] in the binary). Without a client, prompt

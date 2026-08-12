@@ -248,7 +248,7 @@ fn bang_echo_adds_command_and_stdout() {
     let mut app = App::new();
     shell_and_enter(&mut app, "echo bang-app-ok");
     assert!(app.input.is_empty());
-    assert_eq!(app.mode(), Mode::Shell);
+    assert_eq!(app.mode(), Mode::Prompt);
     assert!(
         app.messages
             .iter()
@@ -274,6 +274,7 @@ fn bang_empty_shows_usage() {
     let mut app = App::new();
     app.handle_key(key_char('!'));
     app.handle_key(key(KeyCode::Enter));
+    // Empty Enter does not run bash — stay in shell so the user can type.
     assert_eq!(app.mode(), Mode::Shell);
     assert_eq!(
         app.messages,
@@ -342,11 +343,31 @@ fn slash_in_shell_mode_is_literal_not_candidates() {
 }
 
 #[test]
-fn shell_mode_persists_after_command() {
+fn shell_mode_returns_to_prompt_after_command() {
     let mut app = App::new();
-    shell_and_enter(&mut app, "echo stay");
-    assert_eq!(app.mode(), Mode::Shell);
+    shell_and_enter(&mut app, "echo done");
+    assert_eq!(app.mode(), Mode::Prompt);
     assert!(app.input.is_empty());
+    assert_eq!(app.prompt_title(), " prompt ");
+}
+
+#[test]
+fn shell_mode_returns_to_prompt_after_bash_error() {
+    let mut app = App::new();
+    // Embedded newline is rejected by validate_single_line before spawn.
+    app.handle_key(key_char('!'));
+    // Insert via handle_key would type chars; inject invalid command directly.
+    app.input = "echo a\necho b".into();
+    app.cursor_position = app.input.chars().count();
+    app.handle_key(key(KeyCode::Enter));
+    assert_eq!(app.mode(), Mode::Prompt);
+    assert!(
+        message_texts(&app)
+            .iter()
+            .any(|m| m.starts_with("bash error:")),
+        "messages={:?}",
+        app.messages
+    );
 }
 
 #[test]

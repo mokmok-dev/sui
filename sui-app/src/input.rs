@@ -16,7 +16,10 @@ impl App {
         match self.mode {
             Mode::Shell => {
                 let command = self.input.clone();
-                self.handle_shell_command(&command);
+                if self.handle_shell_command(&command) {
+                    // One-shot: leave shell once the bash command finishes.
+                    self.set_mode(Mode::Prompt);
+                }
             },
             Mode::Prompt => {
                 if self.input.is_empty() {
@@ -76,17 +79,21 @@ impl App {
 
     /// Runs a one-shot shell command via [`crate::bang`].
     ///
+    /// Returns `true` when a non-empty command was submitted (run attempted).
+    /// Empty input shows usage and returns `false` so the caller can stay in
+    /// [`Mode::Shell`].
+    ///
     /// Blocks the event loop until the command finishes or hits the default
     /// timeout ([`sui_tools::DEFAULT_RUN_TIMEOUT`]). Long-running commands will
     /// freeze the TUI until they exit or are killed by that deadline.
     pub(crate) fn handle_shell_command(
         &mut self,
         command: &str,
-    ) {
+    ) -> bool {
         let command = command.trim();
         if command.is_empty() {
             self.add_message("usage: <command>");
-            return;
+            return false;
         }
         self.add_message(format!("! {command}"));
         match crate::bang::run_blocking(command) {
@@ -97,6 +104,7 @@ impl App {
             },
             Err(error) => self.add_message(format!("bash error: {error}")),
         }
+        true
     }
 
     #[allow(clippy::too_many_lines)]
@@ -201,7 +209,7 @@ impl App {
                     self.slash_selected = (self.slash_selected + len - 1) % len;
                 }
             },
-            // Empty prompt + `!` enters shell mode (sticky), like vim `:` for cmdline.
+            // Empty prompt + `!` enters one-shot shell mode (Enter/Esc → Prompt).
             KeyCode::Char('!')
                 if self.mode == Mode::Prompt
                     && self.input.is_empty()
