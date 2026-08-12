@@ -1,9 +1,11 @@
 //! Interaction mode — what the prompt is addressing.
 //!
-//! The border title and Enter semantics follow the active mode. [`Mode::Shell`]
-//! is one-shot: Enter runs a command then returns to [`Mode::Prompt`]; Esc
-//! cancels without running. Add variants here when subagent / workflow surfaces
-//! exist; do not infer mode from input prefixes.
+//! The border title, color, and Enter semantics follow the active mode.
+//! [`Mode::Shell`] is one-shot: Enter runs a command then returns to
+//! [`Mode::Prompt`]; Esc cancels without running. Add variants here when
+//! subagent / workflow surfaces exist; do not infer mode from input prefixes.
+
+use ratatui::style::{Color, Style};
 
 /// Active interaction mode.
 ///
@@ -26,6 +28,21 @@ impl Mode {
         match self {
             Self::Prompt => " prompt ",
             Self::Shell => " shell ",
+        }
+    }
+
+    /// Border style (foreground color) for the prompt widget in this mode.
+    #[must_use]
+    pub fn border_style(self) -> Style {
+        Style::default().fg(self.border_color())
+    }
+
+    /// Border foreground color for the prompt widget in this mode.
+    #[must_use]
+    pub const fn border_color(self) -> Color {
+        match self {
+            Self::Prompt => Color::Cyan,
+            Self::Shell => Color::Magenta,
         }
     }
 }
