@@ -7,18 +7,25 @@
 //! (and slash suggestions) occupy the screen; submitted output is inserted
 //! above it and scrolls into the terminal scrollback.
 //!
-//! Input prefixes:
-//! - `/` — slash commands (`/exit`, `/quit`, plugins)
-//! - `!` — one-shot bash via [`sui_tools::run_line`] (e.g. `! echo foo`);
-//!   the prompt border title switches to `shell`, and command output is flushed
-//!   as dim ghost text (no prompt prefix)
+//! # Modes
+//!
+//! Interaction is sticky [`Mode`] state (vim-like), not inferred from prefixes:
+//! - [`Mode::Prompt`] (default) — chat text; `/` opens slash commands
+//! - [`Mode::Shell`] — entered with `!` on an empty prompt; Enter runs bash
+//!   via [`sui_tools::run_line`]; Esc returns to [`Mode::Prompt`]; output is
+//!   flushed as dim ghost text (no prompt prefix)
+//!
+//! Future surfaces (subagent, workflow) should add [`Mode`] variants rather
+//! than new prefix heuristics.
 
 pub mod app;
 pub(crate) mod bang;
 pub mod input;
+pub mod mode;
 pub mod slash;
 
 pub use app::{App, PROMPT_HEIGHT};
+pub use mode::Mode;
 pub use slash::SlashCommand;
 
 /// Converts a char-based index into a byte offset within `s`.

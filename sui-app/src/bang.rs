@@ -1,8 +1,11 @@
-//! Bang (`!`) shell escape: run a one-shot command via [`sui_tools::run_line`].
+//! Shell command execution for [`crate::Mode::Shell`].
 //!
-//! The TUI event loop is synchronous, so each bang runs on a short-lived worker
-//! thread with its own current-thread Tokio runtime. That avoids
+//! The TUI event loop is synchronous, so each command runs on a short-lived
+//! worker thread with its own current-thread Tokio runtime. That avoids
 //! `block_in_place` (which panics on current-thread runtimes used by many tests).
+//!
+//! Enter shell mode with `!` on an empty prompt; this module only runs the
+//! command once submitted.
 
 use sui_tools::{CommandOutput, DEFAULT_RUN_TIMEOUT, ToolsError, run_line};
 

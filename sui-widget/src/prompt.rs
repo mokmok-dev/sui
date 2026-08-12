@@ -69,7 +69,7 @@ impl<'a> PromptWidget<'a> {
         }
     }
 
-    /// Sets the border title (e.g. `" shell "` for bang mode).
+    /// Sets the border title (e.g. `" shell "` for shell mode).
     #[must_use]
     pub const fn with_title(
         mut self,

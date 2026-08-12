@@ -1,4 +1,4 @@
-use super::{App, PROMPT_HEIGHT, char_index_to_byte};
+use super::{App, Mode, PROMPT_HEIGHT, char_index_to_byte};
 use crate::app::ScrollbackLine;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::backend::{Backend, TestBackend};
@@ -161,14 +161,31 @@ fn insert_middle_of_input() {
 
 // ── slash-command tests ────────────────────────────────────────────
 
-fn type_and_enter(
+fn type_text(
     app: &mut App,
     text: &str,
 ) {
     for c in text.chars() {
         app.handle_key(key_char(c));
     }
+}
+
+fn type_and_enter(
+    app: &mut App,
+    text: &str,
+) {
+    type_text(app, text);
     app.handle_key(key(KeyCode::Enter));
+}
+
+/// Enter shell mode (`!` on empty prompt) then type/run a command.
+fn shell_and_enter(
+    app: &mut App,
+    command: &str,
+) {
+    app.handle_key(key_char('!'));
+    assert_eq!(app.mode(), Mode::Shell);
+    type_and_enter(app, command);
 }
 
 #[test]
@@ -208,8 +225,9 @@ fn normal_text_still_adds_to_messages() {
 #[test]
 fn bang_echo_adds_command_and_stdout() {
     let mut app = App::new();
-    type_and_enter(&mut app, "! echo bang-app-ok");
+    shell_and_enter(&mut app, "echo bang-app-ok");
     assert!(app.input.is_empty());
+    assert_eq!(app.mode(), Mode::Shell);
     assert!(
         app.messages
             .iter()
@@ -233,20 +251,19 @@ fn bang_echo_adds_command_and_stdout() {
 #[test]
 fn bang_empty_shows_usage() {
     let mut app = App::new();
-    type_and_enter(&mut app, "!");
+    app.handle_key(key_char('!'));
+    app.handle_key(key(KeyCode::Enter));
+    assert_eq!(app.mode(), Mode::Shell);
     assert_eq!(
         app.messages,
-        vec![
-            ScrollbackLine::Prompt("!".into()),
-            ScrollbackLine::Prompt("usage: ! <command>".into()),
-        ]
+        vec![ScrollbackLine::Prompt("usage: <command>".into())]
     );
 }
 
 #[test]
 fn bang_nonzero_exit_is_reported() {
     let mut app = App::new();
-    type_and_enter(&mut app, "! exit 9");
+    shell_and_enter(&mut app, "exit 9");
     assert!(
         app.messages
             .iter()
@@ -257,19 +274,58 @@ fn bang_nonzero_exit_is_reported() {
 }
 
 #[test]
-fn shell_mode_title_while_typing_bang() {
+fn shell_mode_entered_with_bang_on_empty_prompt() {
     let mut app = App::new();
+    assert_eq!(app.mode(), Mode::Prompt);
     assert_eq!(app.prompt_title(), " prompt ");
-    assert!(!app.shell_mode());
+
     app.handle_key(key_char('!'));
-    assert!(app.shell_mode());
+    assert_eq!(app.mode(), Mode::Shell);
+    assert!(app.input.is_empty());
     assert_eq!(app.prompt_title(), " shell ");
-    app.handle_key(key_char('e'));
-    assert_eq!(app.prompt_title(), " shell ");
-    app.handle_key(key(KeyCode::Home));
-    app.handle_key(key(KeyCode::Delete));
-    assert!(!app.shell_mode());
+
+    type_text(&mut app, "echo");
+    assert_eq!(app.input, "echo");
+    assert_eq!(app.mode(), Mode::Shell);
+}
+
+#[test]
+fn esc_leaves_shell_mode_without_quitting() {
+    let mut app = App::new();
+    app.handle_key(key_char('!'));
+    type_text(&mut app, "pwd");
+    app.handle_key(key(KeyCode::Esc));
+    assert_eq!(app.mode(), Mode::Prompt);
+    assert!(app.input.is_empty());
+    assert!(!app.should_quit);
     assert_eq!(app.prompt_title(), " prompt ");
+}
+
+#[test]
+fn bang_mid_prompt_inserts_literally() {
+    let mut app = App::new();
+    type_text(&mut app, "hi");
+    app.handle_key(key_char('!'));
+    assert_eq!(app.mode(), Mode::Prompt);
+    assert_eq!(app.input, "hi!");
+}
+
+#[test]
+fn slash_in_shell_mode_is_literal_not_candidates() {
+    let mut app = App::new();
+    app.handle_key(key_char('!'));
+    type_text(&mut app, "/exit");
+    assert_eq!(app.mode(), Mode::Shell);
+    assert!(app.slash_candidates.is_empty());
+    assert_eq!(app.input, "/exit");
+}
+
+#[test]
+fn shell_mode_persists_after_command() {
+    let mut app = App::new();
+    shell_and_enter(&mut app, "echo stay");
+    assert_eq!(app.mode(), Mode::Shell);
+    assert!(app.input.is_empty());
 }
 
 #[test]

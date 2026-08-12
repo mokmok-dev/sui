@@ -1,3 +1,4 @@
+use crate::mode::Mode;
 use crate::slash::{MAX_CANDIDATES, SlashCandidate, SlashCommand};
 use ratatui::{
     DefaultTerminal, Frame, Terminal, TerminalOptions, Viewport,
@@ -17,11 +18,6 @@ pub const PROMPT_HEIGHT: u16 = 3;
 /// cast lints; the assert below locks it to [`MAX_CANDIDATES`].
 const SUGGESTION_PANEL_HEIGHT: u16 = 5;
 const _: () = assert!(SUGGESTION_PANEL_HEIGHT as usize == MAX_CANDIDATES);
-
-/// Border title while the prompt accepts normal / slash input.
-const PROMPT_TITLE: &str = " prompt ";
-/// Border title while bang (`!`) shell mode is active.
-const SHELL_TITLE: &str = " shell ";
 
 /// A single scrollback line pending flush above the inline viewport.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,6 +46,8 @@ pub struct App {
     pub(crate) cursor_position: usize,
     pub(crate) should_quit: bool,
     pub(crate) prompt_prefix: String,
+    /// Sticky interaction mode (see [`Mode`]).
+    pub(crate) mode: Mode,
     /// History of submitted prompts / status / ghost lines.
     ///
     /// New entries are committed above the inline viewport via
@@ -83,6 +81,7 @@ impl App {
             cursor_position: 0,
             should_quit: false,
             prompt_prefix: "❯ ".to_string(),
+            mode: Mode::Prompt,
             messages: Vec::new(),
             flushed_messages: 0,
             viewport_height: PROMPT_HEIGHT,
@@ -95,6 +94,24 @@ impl App {
     /// Request application shutdown.
     pub const fn quit(&mut self) {
         self.should_quit = true;
+    }
+
+    /// Current sticky interaction mode.
+    #[must_use]
+    pub const fn mode(&self) -> Mode {
+        self.mode
+    }
+
+    /// Switch mode, clearing the input buffer and slash suggestions.
+    pub(crate) fn set_mode(
+        &mut self,
+        mode: Mode,
+    ) {
+        self.mode = mode;
+        self.input.clear();
+        self.cursor_position = 0;
+        self.slash_candidates.clear();
+        self.slash_selected = 0;
     }
 
     /// Append a normal (prompt-prefixed) message to the scrollback history.
@@ -116,20 +133,10 @@ impl App {
         self.messages.push(ScrollbackLine::Ghost(msg.into()));
     }
 
-    /// Whether the prompt is in bang (`!`) shell mode.
+    /// Border title for the current mode.
     #[must_use]
-    pub(crate) fn shell_mode(&self) -> bool {
-        self.input.starts_with('!')
-    }
-
-    /// Border title for the current input mode.
-    #[must_use]
-    pub(crate) fn prompt_title(&self) -> &'static str {
-        if self.shell_mode() {
-            SHELL_TITLE
-        } else {
-            PROMPT_TITLE
-        }
+    pub(crate) const fn prompt_title(&self) -> &'static str {
+        self.mode.title()
     }
 
     /// Register a pluggable slash command.

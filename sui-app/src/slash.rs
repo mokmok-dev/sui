@@ -116,7 +116,14 @@ impl App {
     }
 
     /// Rebuilds `slash_candidates` based on the current input.
+    ///
+    /// Slash suggestions only apply in [`crate::Mode::Prompt`].
     pub(crate) fn update_slash_candidates(&mut self) {
+        if self.mode != crate::Mode::Prompt {
+            self.slash_candidates.clear();
+            self.slash_selected = 0;
+            return;
+        }
         if let Some(partial) = self.input.strip_prefix('/') {
             self.slash_candidates.clear();
 
