@@ -3000,8 +3000,21 @@ dependencies = [
  "ratatui",
  "sui-app",
  "sui-llm",
+ "sui-tools",
  "thiserror 2.0.20",
  "tokio",
+]
+
+[[package]]
+name = "sui-agent"
+version = "0.0.0"
+dependencies = [
+ "serde_json",
+ "sui-llm",
+ "sui-tools",
+ "thiserror 2.0.20",
+ "tokio",
+ "wiremock",
 ]
 
 [[package]]
@@ -3014,6 +3027,7 @@ dependencies = [
  "futures",
  "ratatui",
  "serde_json",
+ "sui-agent",
  "sui-llm",
  "sui-tools",
  "sui-widget",
