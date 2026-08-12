@@ -9,7 +9,9 @@
 //!
 //! Input prefixes:
 //! - `/` — slash commands (`/exit`, `/quit`, plugins)
-//! - `!` — one-shot bash via [`sui_tools::run_line`] (e.g. `! echo foo`)
+//! - `!` — one-shot bash via [`sui_tools::run_line`] (e.g. `! echo foo`);
+//!   the prompt border title switches to `shell`, and command output is flushed
+//!   as dim ghost text (no prompt prefix)
 
 pub mod app;
 pub(crate) mod bang;

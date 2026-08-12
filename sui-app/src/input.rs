@@ -25,7 +25,8 @@ impl App {
             let command = self.input[1..].to_owned();
             self.handle_bang_command(&command);
         } else {
-            self.messages.push(self.input.clone());
+            self.messages
+                .push(crate::app::ScrollbackLine::Prompt(self.input.clone()));
         }
         self.input.clear();
         self.cursor_position = 0;
@@ -52,7 +53,7 @@ impl App {
         match crate::bang::run_blocking(command) {
             Ok(output) => {
                 for line in crate::bang::format_output(&output) {
-                    self.add_message(line);
+                    self.add_ghost(line);
                 }
             },
             Err(error) => self.add_message(format!("bash error: {error}")),
