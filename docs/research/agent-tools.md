@@ -31,18 +31,18 @@ LiteLLM がプロバイダ差を吸収する。sui は OpenAI Chat Completions �
 ```mermaid
 sequenceDiagram
   participant TUI as sui-app
-  participant Loop as sui-agent
+  participant Agent as sui-agent
   participant LLM as model
   participant Tools as sui-tools
 
-  TUI->>Loop: run_turn(user)
-  Loop->>LLM: chat_with_tools(messages, specs)
-  LLM-->>Loop: tool_calls
-  Loop->>Tools: call(name, args)
-  Tools-->>Loop: JSON result
-  Loop->>LLM: assistant_tools + role tool
-  LLM-->>Loop: assistant text
-  Loop-->>TUI: Done history
+  TUI->>Agent: run_turn(user)
+  Agent->>LLM: chat_with_tools(messages, specs)
+  LLM-->>Agent: tool_calls
+  Agent->>Tools: call(name, args)
+  Tools-->>Agent: JSON result
+  Agent->>LLM: assistant_tools + role tool
+  LLM-->>Agent: assistant text
+  Agent-->>TUI: Done history
 ```
 
 ## 第一原理
@@ -163,7 +163,7 @@ flowchart TD
   p7 -->|hit| apply
   p8 -->|hit| apply
   p9 -->|hit| apply
-  p9 -->|miss| err[error: not found]
+  p9 -->|miss| err["error: not found"]
 ```
 
 これは「モデルが空白を少し間違えてもファイルを壊さず直す」ための最適化である。
@@ -293,11 +293,11 @@ flowchart LR
   q1 -->|no| q2["need exact line?"]
   q2 -->|yes| grep[grep live disk]
   q2 -->|no| cs
-  grep --> read["read path + offset + limit"]
-  cs --> read
-  read --> q3{"new file?"}
-  q3 -->|yes| write["write path + content"]
-  q3 -->|no| edit[edit SEARCH/REPLACE]
+  grep --> readFile["read path + offset + limit"]
+  cs --> readFile
+  readFile --> q3{"new file?"}
+  q3 -->|yes| writeFile["write path + content"]
+  q3 -->|no| editFile["edit SEARCH/REPLACE"]
 ```
 
 `code_search` と `grep` は分けた方がよい。質問が違う。
@@ -314,7 +314,7 @@ flowchart LR
 
 ```mermaid
 flowchart TD
-  call["read(path, offset?, limit?)"] --> open[open file]
+  readCall["read(path, offset?, limit?)"] --> open[open file]
   open --> slice["slice 1-indexed lines"]
   slice --> cap{line or byte cap?}
   cap -->|ok| out["n: line"]
