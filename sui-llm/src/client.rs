@@ -12,10 +12,11 @@ use async_openai::{
 
 use futures::{Stream, StreamExt};
 
-use crate::{ChatMessage, LlmConfig, LlmError, Role, config::require_non_empty_model};
+use crate::{ChatMessage, LlmConfig, LlmError, Role};
 
 /// Successful non-streaming chat completion.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ChatResponse {
     /// Assistant text from the first choice.
     pub content: String,
@@ -23,11 +24,36 @@ pub struct ChatResponse {
     pub model: String,
 }
 
+impl ChatResponse {
+    /// Builds a response from assistant text and the Proxy model id.
+    #[must_use]
+    pub fn new(
+        content: impl Into<String>,
+        model: impl Into<String>,
+    ) -> Self {
+        Self {
+            content: content.into(),
+            model: model.into(),
+        }
+    }
+}
+
 /// One streamed text delta.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ChatChunk {
     /// Incremental assistant text (may be empty on control chunks).
     pub delta: String,
+}
+
+impl ChatChunk {
+    /// Builds a chunk from an incremental text delta.
+    #[must_use]
+    pub fn new(delta: impl Into<String>) -> Self {
+        Self {
+            delta: delta.into(),
+        }
+    }
 }
 
 /// Owned stream of chat chunks from [`LlmClient::chat_stream`].
@@ -37,10 +63,24 @@ pub type ChatStream = Pin<Box<dyn Stream<Item = Result<ChatChunk, LlmError>> + S
 ///
 /// `async-openai` may emit `tracing` events that include request/response
 /// details depending on subscriber filters; treat log sinks as trusted.
-#[derive(Clone, Debug)]
+///
+/// This crate does not set an HTTP timeout; wrap awaits with your runtime's
+/// timeout helper (for example Tokio's `timeout`) when you need one.
+#[derive(Clone)]
 pub struct LlmClient {
     inner: Client<OpenAIConfig>,
     default_model: String,
+}
+
+impl std::fmt::Debug for LlmClient {
+    fn fmt(
+        &self,
+        f: &mut std::fmt::Formatter<'_>,
+    ) -> std::fmt::Result {
+        f.debug_struct("LlmClient")
+            .field("default_model", &self.default_model)
+            .finish_non_exhaustive()
+    }
 }
 
 impl LlmClient {
@@ -81,7 +121,8 @@ impl LlmClient {
     ///
     /// # Errors
     ///
-    /// Returns transport/API errors, [`LlmError::EmptyResponse`], or
+    /// Returns [`LlmError::InvalidArgument`] for an empty `messages` slice,
+    /// transport/API errors, [`LlmError::EmptyResponse`], or
     /// [`LlmError::Refused`].
     pub async fn chat(
         &self,
@@ -94,15 +135,16 @@ impl LlmClient {
     ///
     /// # Errors
     ///
-    /// Returns [`LlmError::InvalidConfig`] for an empty/whitespace model,
-    /// transport/API errors, [`LlmError::EmptyResponse`], or
-    /// [`LlmError::Refused`].
+    /// Returns [`LlmError::InvalidArgument`] for an empty/whitespace model or an
+    /// empty `messages` slice, transport/API errors,
+    /// [`LlmError::EmptyResponse`], or [`LlmError::Refused`].
     pub async fn chat_with_model(
         &self,
         model: &str,
         messages: &[ChatMessage],
     ) -> Result<ChatResponse, LlmError> {
-        let model = require_non_empty_model(model)?;
+        let model = require_model_argument(model)?;
+        require_non_empty_messages(messages)?;
         let request = CreateChatCompletionRequestArgs::default()
             .model(model)
             .messages(to_openai_messages(messages))
@@ -113,21 +155,18 @@ impl LlmClient {
         if let Some(content) = choice
             .message
             .content
-            .clone()
+            .as_deref()
             .filter(|text| !text.is_empty())
         {
-            return Ok(ChatResponse {
-                content,
-                model: response.model,
-            });
+            return Ok(ChatResponse::new(content, response.model));
         }
         if let Some(refusal) = choice
             .message
             .refusal
-            .clone()
+            .as_deref()
             .filter(|text| !text.is_empty())
         {
-            return Err(LlmError::Refused(refusal));
+            return Err(LlmError::Refused(refusal.to_owned()));
         }
         Err(LlmError::EmptyResponse)
     }
@@ -144,8 +183,9 @@ impl LlmClient {
     ///
     /// # Errors
     ///
-    /// Returns transport/API errors while opening the stream. Per-chunk errors
-    /// are yielded on the returned stream.
+    /// Returns [`LlmError::InvalidArgument`] for an empty `messages` slice, or
+    /// transport/API errors while opening the stream. Per-chunk errors are
+    /// yielded on the returned stream.
     pub async fn chat_stream(
         &self,
         messages: &[ChatMessage],
@@ -164,15 +204,16 @@ impl LlmClient {
     ///
     /// # Errors
     ///
-    /// Returns [`LlmError::InvalidConfig`] for an empty/whitespace model, or
-    /// transport/API errors while opening the stream. Per-chunk errors are
-    /// yielded on the returned stream.
+    /// Returns [`LlmError::InvalidArgument`] for an empty/whitespace model or an
+    /// empty `messages` slice, or transport/API errors while opening the
+    /// stream. Per-chunk errors are yielded on the returned stream.
     pub async fn chat_stream_with_model(
         &self,
         model: &str,
         messages: &[ChatMessage],
     ) -> Result<ChatStream, LlmError> {
-        let model = require_non_empty_model(model)?;
+        let model = require_model_argument(model)?;
+        require_non_empty_messages(messages)?;
         let request = CreateChatCompletionRequestArgs::default()
             .model(model)
             .messages(to_openai_messages(messages))
@@ -183,14 +224,31 @@ impl LlmClient {
     }
 }
 
+fn require_model_argument(model: &str) -> Result<&str, LlmError> {
+    let trimmed = model.trim();
+    if trimmed.is_empty() {
+        return Err(LlmError::InvalidArgument(
+            "model must be a non-empty string".into(),
+        ));
+    }
+    Ok(trimmed)
+}
+
+fn require_non_empty_messages(messages: &[ChatMessage]) -> Result<(), LlmError> {
+    if messages.is_empty() {
+        return Err(LlmError::InvalidArgument(
+            "messages must not be empty".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn map_stream_item(
     item: Result<CreateChatCompletionStreamResponse, async_openai::error::OpenAIError>
 ) -> Result<ChatChunk, LlmError> {
     let chunk = item?;
     let Some(choice) = chunk.choices.first() else {
-        return Ok(ChatChunk {
-            delta: String::new(),
-        });
+        return Ok(ChatChunk::new(String::new()));
     };
     if let Some(refusal) = choice
         .delta
@@ -200,9 +258,9 @@ fn map_stream_item(
     {
         return Err(LlmError::Refused(refusal.to_owned()));
     }
-    Ok(ChatChunk {
-        delta: choice.delta.content.clone().unwrap_or_default(),
-    })
+    Ok(ChatChunk::new(
+        choice.delta.content.as_deref().unwrap_or_default(),
+    ))
 }
 
 fn to_openai_messages(messages: &[ChatMessage]) -> Vec<ChatCompletionRequestMessage> {
@@ -276,6 +334,28 @@ mod tests {
         let client = LlmClient::new(&config);
         let rendered = format!("{client:?}");
         assert!(!rendered.contains("super-secret-key"), "{rendered}");
+        assert!(rendered.contains("default_model: \"m\""), "{rendered}");
+        assert!(!rendered.contains("api_key"), "{rendered}");
+        assert!(!rendered.contains("request_client"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn chat_rejects_empty_messages() {
+        let config = LlmConfig::new("http://localhost:4000", "k", "m").expect("config");
+        let client = LlmClient::new(&config);
+        let err = client.chat(&[]).await.expect_err("empty messages");
+        assert!(matches!(err, LlmError::InvalidArgument(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn chat_stream_rejects_empty_messages() {
+        let config = LlmConfig::new("http://localhost:4000", "k", "m").expect("config");
+        let client = LlmClient::new(&config);
+        let result = client.chat_stream(&[]).await;
+        assert!(
+            matches!(result, Err(LlmError::InvalidArgument(_))),
+            "expected InvalidArgument, got Ok stream"
+        );
     }
 
     #[tokio::test]
@@ -372,7 +452,7 @@ mod tests {
             .chat_with_model("  ", &[ChatMessage::user("x")])
             .await
             .expect_err("blank model");
-        assert!(matches!(err, LlmError::InvalidConfig(_)));
+        assert!(matches!(err, LlmError::InvalidArgument(_)));
     }
 
     #[tokio::test]
@@ -496,6 +576,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chat_stream_maps_mid_stream_error_event() {
+        let server = MockServer::start().await;
+        // Malformed JSON after a valid chunk should surface as a stream item error.
+        let sse = concat!(
+            "data: {\"id\":\"chatcmpl-s\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"proxy-model\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hel\"},\"finish_reason\":null}]}\n\n",
+            "data: {not-json\n\n",
+            "data: [DONE]\n\n",
+        );
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server, "proxy-model");
+        let mut stream = client
+            .chat_stream(&[ChatMessage::user("hi")])
+            .await
+            .expect("open stream");
+
+        let first = stream.next().await.expect("item").expect("chunk");
+        assert_eq!(first.delta, "hel");
+        let err = stream.next().await.expect("item").expect_err("parse error");
+        assert!(matches!(err, LlmError::Api(_)), "{err:?}");
+        assert_eq!(err.to_string(), "LLM API error");
+    }
+
+    #[tokio::test]
     async fn chat_empty_choices_is_empty_response() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -577,8 +689,8 @@ mod tests {
             .chat_stream_with_model("  ", &[ChatMessage::user("x")])
             .await;
         assert!(
-            matches!(result, Err(LlmError::InvalidConfig(_))),
-            "expected InvalidConfig, got Ok stream"
+            matches!(result, Err(LlmError::InvalidArgument(_))),
+            "expected InvalidArgument, got Ok stream"
         );
     }
 

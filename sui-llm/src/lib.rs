@@ -14,6 +14,10 @@
 //! `base_url` is trusted operator config (see [`LlmConfig`]). Do not pass
 //! untrusted URLs.
 //!
+//! Request timeouts are not configured by this crate; wrap calls with your
+//! runtime's timeout helper (for example Tokio's `timeout`) at the call site if
+//! you need one.
+//!
 //! # Example
 //!
 //! ```no_run

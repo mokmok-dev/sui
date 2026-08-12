@@ -7,14 +7,22 @@ use thiserror::Error;
 /// [`LlmError::Api`] keeps the underlying `async-openai` error for
 /// [`std::error::Error::source`], but [`Display`] and [`Debug`] stay opaque so
 /// response bodies and URLs are not printed by default logging.
+///
+/// Walking the [`std::error::Error::source`] chain (or logging with
+/// `anyhow`/`eyre` full chains) may still expose Proxy response bodies and
+/// request URLs from the underlying error — treat that as a trusted sink.
 #[derive(Error)]
+#[non_exhaustive]
 pub enum LlmError {
     /// A required environment variable was not set.
     #[error("missing environment variable `{0}`")]
     MissingEnv(&'static str),
-    /// Configuration values failed validation.
+    /// Configuration values failed validation (`LlmConfig` / env).
     #[error("invalid configuration: {0}")]
     InvalidConfig(String),
+    /// A call-site argument failed validation (model override, messages, …).
+    #[error("invalid argument: {0}")]
+    InvalidArgument(String),
     /// The OpenAI-compatible HTTP/API layer failed.
     #[error("LLM API error")]
     Api(#[source] async_openai::error::OpenAIError),
@@ -40,6 +48,7 @@ impl fmt::Debug for LlmError {
         match self {
             Self::MissingEnv(name) => f.debug_tuple("MissingEnv").field(name).finish(),
             Self::InvalidConfig(msg) => f.debug_tuple("InvalidConfig").field(msg).finish(),
+            Self::InvalidArgument(msg) => f.debug_tuple("InvalidArgument").field(msg).finish(),
             Self::Api(_) => f.write_str("Api(/* redacted */)"),
             Self::EmptyResponse => f.write_str("EmptyResponse"),
             Self::Refused(msg) => f.debug_tuple("Refused").field(msg).finish(),
