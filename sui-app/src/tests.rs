@@ -715,6 +715,9 @@ fn flush_ghost_messages_omit_prompt_prefix() {
     app.add_ghost("hi");
     infallible(app.flush_messages(&mut terminal));
 
+    // Ghost rows must shift the inline viewport the same way prompt rows do.
+    assert_eq!(terminal.get_frame().area().y, 6);
+
     let row = |backend: &TestBackend, y: u16| -> String {
         let area = backend.buffer().area;
         (0..area.width)
@@ -726,6 +729,40 @@ fn flush_ghost_messages_omit_prompt_prefix() {
     let backend = terminal.backend();
     assert_eq!(row(backend, 4), "> ! echo hi");
     assert_eq!(row(backend, 5), "hi");
+}
+
+#[test]
+fn teardown_after_pending_ghost_flush_parks_cursor_below_output() {
+    // Mirrors App::run exit path: flush queued bang ghosts, then tear down.
+    let mut terminal = inline_test_terminal(40, 12, 4);
+    let mut app = App::new().with_prompt_prefix("> ");
+    app.add_message("! echo hi");
+    app.add_ghost("hi");
+    app.add_ghost("bye");
+    assert_eq!(app.flushed_messages, 0);
+
+    infallible(app.flush_messages(&mut terminal));
+    infallible(App::teardown_inline(&mut terminal));
+
+    assert_eq!(app.flushed_messages, 3);
+    assert_eq!(
+        infallible(terminal.get_cursor_position()),
+        Position::new(0, 7),
+        "cursor must sit just below flushed ghost lines"
+    );
+
+    let row = |backend: &TestBackend, y: u16| -> String {
+        let area = backend.buffer().area;
+        (0..area.width)
+            .map(|x| backend.buffer()[(x, y)].symbol().to_string())
+            .collect::<String>()
+            .trim_end()
+            .to_string()
+    };
+    let backend = terminal.backend();
+    assert_eq!(row(backend, 4), "> ! echo hi");
+    assert_eq!(row(backend, 5), "hi");
+    assert_eq!(row(backend, 6), "bye");
 }
 
 #[test]
