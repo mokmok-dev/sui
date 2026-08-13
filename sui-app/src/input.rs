@@ -64,7 +64,7 @@ impl App {
         self.add_message(prompt);
         let Some(client) = self.llm.clone() else {
             self.add_message(
-                "llm not configured: set LITELLM_BASE_URL and LITELLM_MODEL (optional LITELLM_API_KEY)",
+                "llm not configured: set [llm] in config.toml or SUI_LLM_BASE_URL and SUI_LLM_MODEL (optional SUI_LLM_API_KEY)",
             );
             return;
         };

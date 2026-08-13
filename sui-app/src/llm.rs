@@ -25,7 +25,7 @@ const SPINNER_FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦
 
 /// Incremental update from the background chat worker.
 pub enum LlmStreamMsg {
-    /// A text delta from the Proxy stream (plain chat path).
+    /// A text delta from the OpenAI-compatible stream (plain chat path).
     Chunk(String),
     /// A local tool finished; render as ghost scrollback.
     Tool(String),

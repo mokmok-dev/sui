@@ -26,7 +26,8 @@ flowchart TD
   append --> sample
 ```
 
-LiteLLM がプロバイダ差を吸収する。sui は OpenAI Chat Completions の形だけ話せばよい。
+sui-llm が OpenAI 互換の Chat Completions / Responses wire format を扱う。
+sui-agent はツール呼び出しの抽象だけを利用する。
 
 ```mermaid
 sequenceDiagram
@@ -225,7 +226,7 @@ flowchart TB
   agent[sui-agent]
   llm[sui-llm]
   tools[sui-tools]
-  model[LiteLLM / OpenAI]
+  model[OpenAI-compatible API]
   fs[filesystem / shell]
 
   bin -->|"index cwd + coding_registry"| app
