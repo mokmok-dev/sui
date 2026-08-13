@@ -4,9 +4,9 @@ use crate::llm::LlmStreamMsg;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::backend::{Backend, TestBackend};
 use ratatui::layout::Position;
-use ratatui::style::Color;
 use ratatui::{Terminal, TerminalOptions, Viewport};
 use std::sync::mpsc;
+use sui_theme::Theme;
 
 fn message_texts(app: &App) -> Vec<&str> {
     app.messages
@@ -879,10 +879,11 @@ fn flush_prompt_lines_are_padded_and_gray_highlighted() {
             .bg
             .expect("flushed prompt rows must carry a background color")
     };
-    // Pad row above, prompt row, pad row below all share the same pale band.
-    assert_eq!(bg(4), Color::Gray);
-    assert_eq!(bg(5), Color::Gray);
-    assert_eq!(bg(6), Color::Gray);
+    // Pad row above, prompt row, pad row below all share the same highlighted band.
+    let back = Theme::DEFAULT.prompt_background;
+    assert_eq!(bg(4), back);
+    assert_eq!(bg(5), back);
+    assert_eq!(bg(6), back);
     let symbol = |y: u16| buf[(0, y)].symbol();
     assert_eq!(symbol(5), ">");
 }

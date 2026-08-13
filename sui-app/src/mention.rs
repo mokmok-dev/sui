@@ -13,12 +13,8 @@
 use crate::App;
 use crate::char_index_to_byte;
 use crate::slash::MAX_CANDIDATES;
-use ratatui::{
-    Frame,
-    layout::Rect,
-    style::{Color, Style},
-    widgets::Paragraph,
-};
+use ratatui::{Frame, layout::Rect, style::Style, widgets::Paragraph};
+use sui_theme::Theme;
 
 /// Upper bound on files cached for the picker (bounds the one-time walk cost).
 const FILE_CACHE_LIMIT: usize = 10_000;
@@ -165,7 +161,7 @@ impl App {
         frame: &mut Frame,
         area: Rect,
     ) {
-        let selected_style = Style::default().fg(Color::Black).bg(Color::Yellow);
+        let selected_style = Theme::DEFAULT.selected_style();
         let normal_style = Style::default();
 
         for (i, path) in self.at_candidates.iter().enumerate() {

@@ -5,13 +5,14 @@ use ratatui::{
     DefaultTerminal, Frame, Terminal, TerminalOptions, Viewport,
     backend::{Backend, CrosstermBackend},
     layout::{Constraint, Layout, Position},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Text},
     widgets::{Paragraph, Widget},
 };
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::Instant;
 use sui_llm::{ChatMessage, ChatResponse, LlmClient};
+use sui_theme::Theme;
 use sui_widget::{PROMPT_MIN_HEIGHT, PromptWidget, wrap_prefixed, wrap_text};
 
 /// In-flight LLM chat: worker stream channel + spinner clock.
@@ -31,10 +32,6 @@ impl PendingLlm {
 
 /// Minimum rows occupied by the bordered prompt widget (single content line).
 pub const PROMPT_HEIGHT: u16 = PROMPT_MIN_HEIGHT;
-
-/// Pale-gray background applied to flushed prompt lines so that previously
-/// submitted prompts stand out from assistant replies in the scrollback.
-const PROMPT_FLUSH_BG: Color = Color::Gray;
 
 /// Number of blank rows padded above and below each flushed prompt line.
 const PROMPT_FLUSH_PADDING: usize = 1;
@@ -541,7 +538,7 @@ impl App {
                     Self::insert_wrapped_rows(
                         terminal,
                         &rows,
-                        Style::default().bg(PROMPT_FLUSH_BG),
+                        Theme::DEFAULT.prompt_flush_style(),
                     )?;
                 },
                 ScrollbackLine::Ghost(text) => {

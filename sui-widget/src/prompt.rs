@@ -2,10 +2,11 @@ use crate::segment_ranges;
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
-    style::{Color, Style},
+    style::Style,
     text::{Line, Text},
     widgets::{Block, Borders, Paragraph, Widget},
 };
+use sui_theme::Theme;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Minimum block height (top + bottom borders + one content row).
@@ -65,7 +66,7 @@ impl<'a> PromptWidget<'a> {
         Self {
             block: Block::default()
                 .borders(Borders::ALL)
-                .style(Style::default().fg(Color::Cyan)),
+                .style(Theme::DEFAULT.prompt_style()),
             input,
             cursor_position,
             prompt_prefix,
@@ -195,6 +196,7 @@ fn wrapped_lines(
 mod tests {
     use super::*;
     use ratatui::layout::Rect;
+    use ratatui::style::Color;
 
     #[test]
     fn wrapped_lines_empty_input() {

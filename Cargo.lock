@@ -3029,6 +3029,7 @@ dependencies = [
  "serde_json",
  "sui-agent",
  "sui-llm",
+ "sui-theme",
  "sui-tools",
  "sui-widget",
  "tokio",
@@ -3048,6 +3049,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "sui-theme"
+version = "0.0.0"
+dependencies = [
+ "ratatui",
+]
+
+[[package]]
 name = "sui-tools"
 version = "0.0.0"
 dependencies = [
@@ -3064,6 +3072,7 @@ name = "sui-widget"
 version = "0.0.0"
 dependencies = [
  "ratatui",
+ "sui-theme",
  "unicode-width",
 ]
 
