@@ -1,7 +1,7 @@
 # Zettelkasten 着想のメモリエンジン
 
-調査対象: セッション横断の LLM コンテキスト管理。構想は fleeting note の永続化と promote（再合成）による次回プロンプト組み立て。技術候補は SQLite、sqlx、recursive CTE、FTS5 スコアリング。
-現状: `sui-app` の `chat_history` はターンごとに置換され、上限も圧縮もない。検索は `sui-tools` のコード向け BM25 / Tantivy。永続ジャーナルは `sui-workflow` の再生ログ。
+調査対象: セッション横断の LLM コンテキスト管理。構想は fleeting note の永続化と promote（再合成）による次回プロンプト組み立て。ストアは SQLite。ドライバは rusqlite（同期）。抽出は FTS5。リンクがあるときだけ recursive CTE。
+現状: `sui-app` の `chat_history` はターンごとに置換され、上限も圧縮もない。検索は `sui-tools` のコード向け BM25 / Tantivy。永続ジャーナルは `sui-workflow` の再生ログ。sqlx は設計から外す。
 
 ## 結論
 
@@ -11,7 +11,9 @@
 
 「重要なものを残し、それ以外を忘れる」はホストが解けない問題である。何が重要かは次のユーザー発話が決める。転換は正しい。忘却は削除ではなく、**今回の予算に選ばれなかった**ことである。
 
-SQLite + FTS5 はその抽出に足りる。recursive CTE はリンクを持つときだけ 1–2 hop の近傍拡大に使う。sqlx のコンパイル時クエリ検査は後回し。Tantivy をノート用に二重に持たない。埋め込みも持たない。
+SQLite + FTS5 はその抽出に足りる。ドライバは rusqlite の同期 API で足りる。async で包まない。recursive CTE はリンクを持つときだけ 1–2 hop の近傍拡大に使う。Tantivy をノート用に二重に持たない。埋め込みも持たない。
+
+`code_search` の Okapi/Lucene 系 BM25 と FTS5 の `bm25()` は **同名の別物** である。符号、IDF、トークン、コーパス、クエリ単位が違う。スコアを共有・加算・共通トレイト化しない。抽出の融合が要るなら順位だけを RRF する。
 
 最初に実装すべきは「カードの袋 + FTS 抽出 + 予算カット」である。Zettelkasten の語彙、進化するノート、LLM による promote 再合成は、抽出がプロンプトを実際に短くしてから足す。
 
@@ -80,7 +82,7 @@ flowchart TB
 ```
 
 - `App::chat_history` は最初のエージェントターンで `system_prompt(cwd)` を先頭に置き、`Done` で完全置換する。失敗時はユーザー行を楽観的に積まない。上限はない。ツール結果は履歴に残る。
-- `code_search` はワークスペースのソースに対する語彙検索である。ノートではない。トークナイザは ASCII / camelCase / snake_case。Tantivy は同じトークン列の永続インデックス。
+- `code_search` はワークスペースのソースに対する語彙検索である。ノートではない。トークナイザは ASCII / camelCase / snake_case。スコアは自前の Lucene 系 IDF で、大きいほど良い。Tantivy は同じトークン列の永続インデックスであり、ノート用 FTS5 とは別エンジンである。
 - `Journal` はワークフローの content-hash 再生である。意味検索の対象ではない。ノートストアと混ぜると、チェックサム不変条件が壊れる。
 
 メモリはツールループの外側にある。`run_turn` が `messages` を全部送る前提を、ホストが「短い working set を渡す」に変える。ツール契約（name + schema + execute）は触らない。
@@ -126,11 +128,11 @@ note_fts        FTS5(body, kind)  -- content=note または外部 content
 
 ## 抽出：FTS5 シード + 任意の CTE + 融合スコア
 
-SQLite FTS5 は仮想テーブルに転置インデックスを持ち、補助関数 `bm25()` と隠れ列 `rank` を返す。**数値が小さい（より負）ほど良い**。`sui-tools` の `Bm25Index` は大きいほど良い。符号を混ぜると順位が逆になる。
+SQLite FTS5 は仮想テーブルに転置インデックスを持ち、補助関数 `bm25()` と隠れ列 `rank` を返す。ノート抽出は **この順位だけ** を使う。`sui-tools::Bm25Index` のスコア関数は呼ばない。
 
 `ORDER BY rank` は `ORDER BY bm25(table)` より速い（SQLite ドキュメント）。列ウェイトが要るときだけ `bm25(note_fts, w_body, w_kind)` を使う。
 
-シードはユーザー発話（と直近のカード本文）を FTS クエリにした MATCH である。FTS5 クエリ言語は AND/OR/NOT/フレーズ/プレフィックスを持つ。モデルが出した自然文をそのまま MATCH に渡すと構文エラーになる。クエリはホストがトークン化する。コード検索と同じ ASCII トークナイザをノートにも使うか、FTS5 の `unicode61` に任せるかは実装時に一つに決める。混ぜない。
+シードはユーザー発話（と直近のカード本文）を FTS クエリにした MATCH である。FTS5 クエリ言語は AND/OR/NOT/フレーズ/プレフィックスを持つ。モデルが出した自然文をそのまま MATCH に渡すと構文エラーになる。クエリはホストが FTS 向けにエスケープ / トークン化する。コード検索の `tokenize` は使わない。
 
 recursive CTE はグラフを全走査するためではない。FTS で得た id 集合を起点に、深さ 1–2、行数 LIMIT 付きで隣接を足す。
 
@@ -146,18 +148,18 @@ SQLite の制約（公式 `WITH` ドキュメント）:
 
 | 信号 | 向き | 由来 |
 | --- | --- | --- |
-| FTS `rank` | より負が良い | 語彙一致 |
-| `exp(-λ * depth)` | リンク距離 | CTE |
-| `1 / (1 + age_hours)` | 新しさ | `created_ms` |
+| FTS `rank` の順位 | より負が良い（値そのものは足さない） | 語彙一致 |
+| リンク距離の順位 | 浅いほど良い | CTE |
+| 新しさの順位 | 新しいほど良い | `created_ms` |
 | session 一致 | バイナリ | 同じセッション |
 
-融合は Reciprocal Rank Fusion（各ランキングの `1/(k+rank)` を足す）が実装が短い。重み付き和は正規化を間違える。RRF は「FTS の負の bm25 を 0–1 に潰す」作業を避ける。
+融合は Reciprocal Rank Fusion（各ランキングの `1/(k+rank)` を足す）。FTS の生 `bm25()` と `Bm25Index` の生スコアは加算しない。スケールも符号も IDF も違う。
 
 予算カットはトークン概算（文字数 / 4 で足りる。正確な tokenizer は後）で上から詰める。system prompt と **今のユーザー発話** は常に残す。カードは user メッセージの前に、短いブロックとして足す。assistant/tool の生ログは載せない。それが忘却である。
 
 ```mermaid
 flowchart TD
-  q[user prompt tokens] --> tok[host tokenize]
+  q[user prompt tokens] --> tok["host: FTS MATCH query"]
   tok --> match["note_fts MATCH"]
   match --> seedIds[top N ids]
   seedIds --> cte["WITH RECURSIVE hops <= 2"]
@@ -166,40 +168,78 @@ flowchart TD
   cap --> msgs["system + promoted cards + user"]
 ```
 
+## 二つの BM25 は別エンジンである
+
+名前が同じなので混ぜたくなる。混ぜない。`code_search` が解いているのは「この識別子はどのファイルか」である。FTS5 が解いているのは「この発話に近いカードはどれか」である。コーパスもトークンもクエリ単位も IDF も符号も違う。
+
+| | `sui-tools::Bm25Index`（と Tantivy 経路） | SQLite FTS5 `bm25()` |
+| --- | --- | --- |
+| コーパス | ソースファイル。拡張子・サイズ・symlink ポリシー付き | 原子的カード本文 |
+| トークン | ASCII 英数 / `_`、camelCase / snake_case 分割 | FTS5 トークナイザ（既定は unicode61 系）。コード分割はしない |
+| クエリ | ユニークトークンのバッグ。フレーズなし | MATCH のフレーズ列。AND/OR/プレフィックスがある |
+| TF 飽和 | Okapi: `tf*(k1+1) / (tf + k1*(1-b+b*dl/avgdl))` | 同じ形。`k1=1.2`, `b=0.75` はハードコード |
+| IDF | Lucene 系 `ln(1 + (N-df+0.5)/(df+0.5))`。常に正 | Robertson `ln((N-n(qi)+0.5)/(n(qi)+0.5))`。df が N/2 を超えると負になりうる |
+| 符号 | 大きいほど良い。`ORDER BY score DESC` | 公式が `-1` を掛ける。より負が良い。`ORDER BY rank` 昇順 |
+| 単位 | ターム（トークン） | フレーズ |
+| 列ウェイト | なし | `bm25(table, w0, w1, …)` |
+
+共通しているのは「語彙頻度と文書長で並べる」という族だけである。実装を共有する理由はない。`LexicalSearch` トレイトで FTS5 を包まない。ノート抽出のテストは FTS の順位で書く。コード検索のテストは `Bm25Index` の順位で書く。
+
+融合が必要なら **順位** だけを RRF する。`rank` の -3.2 と `SearchHit.score` の 12.4 を足すと、符号と IDF の差が順位を壊す。
+
 ## 技術選定
 
 ### SQLite
 
 ノートは小さく、トランザクションが要り、グラフと全文が同じファイルに載る。プロセス内、依存ゼロに近い、クラッシュ耐性は `journal_mode=WAL` + コミット時 `synchronous=NORMAL` でコーディング TUI には足りる。ワークフローの `fsync` 出力ゲートほど強くしなくてよい。ノートは再生同一性ではない。
 
-単一ライターを守る。TUI は LLM ワーカーを別スレッドで回している。DB はワーカー側か、チャンネル越しの一台の接続に閉じる。イベントループから直接書かない。
+### rusqlite（同期 API）
+
+同期であることは障害ではない。sui の I/O 境界にすでに合っている。
+
+今のスレッド模型:
+
+```mermaid
+flowchart LR
+  tui["TUI thread: crossterm poll"]
+  worker["OS thread: current-thread tokio"]
+  tui -->|"agent_spawn / mpsc"| worker
+  worker -->|"Done history"| tui
+```
+
+- TUI スレッドは LLM を待たない。`agent_spawn` はすぐ戻り、チャンネルを poll する。
+- LLM / ツールループは **別 OS スレッド** の current-thread runtime で `block_on` する。
+- `code_search` も `edit` も、そのワーカー上で **同期** に走る。`Tool::call` の戻りが `Future` なのは bash の sleep / wait のためである。BM25 検索は `async move { self.index.search(...) }` で、中身は同期 CPU である。
+
+メモリの MVP はツールループの外にある。
+
+1. **抽出:** `agent_spawn` の直前、TUI スレッド。ユーザー発話から FTS して working set を組む。ノート数が 10^5 未満ならミリ秒。crossterm の 80ms スピナー間隔より短い。
+2. **捕獲:** `Done` の直後、同じ TUI スレッド。ホスト規則で INSERT。
+3. sample 中は DB に触らない。
+
+この二点だけなら `Connection` は `App` が所有して TUI スレッドだけで使う。rusqlite の契約と一致する。`Connection` は `Send + !Sync`。一つの接続を同時に二スレッドから叩かない。SQLite の multi-thread モード（rusqlite 既定の `SQLITE_OPEN_NOMUTEX`）は「接続ごとに一個のスレッド」を要求する。ちょうどそれである。
+
+後から `note_write` をツールにするなら、ワーカーに **別の** `Connection` を開く。WAL なら読みと書きはファイルレベルで共存する。一つの `Connection` を `Arc` で共有しない。`r2d2` も `tokio-rusqlite` も `spawn_blocking` も要らない。接続プールはスレッドが増えてから足す。今はスレッドが二つで、メモリ I/O は片方にしかない。
+
+TUI スレッドで同期 SQL を呼ぶことの拒否理由は「イベントループを止める」である。止める長さがディスク上の短い FTS なら、すでに `bang` の同期シェルより短い。LLM の 10 分タイムアウトやツールの 30s bash とは桁が違う。async 化は、この計測が悪くなってからにする。
+
+ワークスペースは `unsafe_code = deny` だが、依存の rusqlite / libsqlite3-sys は対象外である。自 crate に unsafe を書かない。
+
+**推奨:** `rusqlite` + `features = ["bundled"]`。実行時 SQL。コンパイル時クエリ検査なし。Postgres なし。sqlx なし。
 
 ### FTS5
 
-バンドル SQLite（sqlx `sqlite` / rusqlite `bundled`）は通常 FTS5 込みである。システム libsqlite に動的リンクすると、ディストロが FTS5 なしでビルドしていることがある。sui は flake / crane でビルドするので **バンドルを選ぶ**。その場合 C コンパイラが要る。
+`bundled` は通常 FTS5 込みである。システム libsqlite に動的リンクすると、ディストロが FTS5 なしでビルドしていることがある。sui は flake / crane でビルドするのでバンドルを選ぶ。C コンパイラが要る。
 
-今の `flake.nix` の `devShells.default` は `mkShellNoCC` で、crane の `commonArgs` に `nativeBuildInputs` がない。sqlx/rusqlite の bundled SQLite を足すと、**flake に `clang`（と必要なら `pkg-config`）を足す**のが前提条件になる。これはメモリ設計ではなくビルド設計のコストである。無視できない。
+今の `flake.nix` の `devShells.default` は `mkShellNoCC` で、crane の `commonArgs` に `nativeBuildInputs` がない。rusqlite bundled を足すと、**flake に `clang` を足す**のが前提条件になる。メモリ設計ではなくビルド設計のコストである。無視できない。
 
-日本語本文は FTS5 `unicode61` の方がデフォルト ASCII トークナイザよりましである。コード識別子は既存 `tokenize` の前処理を FTS 投入前にかける。本文種でトークナイザを切り替えない。前処理を一系統にする。
+日本語本文は FTS5 `unicode61` の方が、コード検索の ASCII トークナイザよりましである。コード識別子をカードに書くなら、投入前に既存 `tokenize` で前処理するか、書かない。コード検索のトークナイザを FTS5 に移植して「BM25 を揃える」のは、上の表が示す通り揃わない。やらない。
 
 ### recursive CTE
 
-sqlx からも rusqlite からもただの SQL である。ドライバ制約はない。制約はクエリ設計側（サイクル、LIMIT、深さ）にある。
+rusqlite からはただの SQL である。ドライバ制約はない。制約はクエリ設計側（サイクル、LIMIT、深さ）にある。
 
 リンク表が空、または抽出がシードだけで予算を埋めるなら、CTE を走らせない。グラフは最適化ではない。リンクが無い抽出を遅くするだけである。
-
-### sqlx
-
-sqlx を選ぶ理由は普通、コンパイル時の `query!` である。FTS5 仮想テーブルと recursive CTE はその旨味が薄い。
-
-- `query!` は検証用 DB とスキーマが要る。FTS5 は仮想テーブルなので、マクロの型推論が普通の表より弱い。
-- 実行時の `sqlx::query` ならコンパイル時検査は使っていない。そのとき sqlx は非同期とマクロ基盤のコストだけ残る。
-- sui の LLM 経路は already `tokio` current-thread なので非同期自体は障害ではない。
-- ワークスペースは `unsafe_code = deny` だが、依存 crate の unsafe は対象外。sqlx-sqlite / libsqlite3-sys は内部で unsafe を使う。 rusqlite も同じ。
-
-**推奨:** ノート crate のクエリは実行時 SQL で書く。最初のドライバは rusqlite（同期、bundled、FTS5 の実例が多い）か sqlx の runtime query のどちらでもよい。コンパイル時マクロ、`sqlx-cli`、`.sqlx` オフラインキャッシュ、`DATABASE_URL` は自動化の先行であり、スキーマが固まるまで持たない。
-
-sqlx に寄せるなら `features = ["runtime-tokio", "sqlite"]`（bundled）に閉じる。Postgres を「将来」で有効化しない。ノートはローカルファイルである。
 
 ## 捕獲：誰が「重要」を決めるか
 
@@ -254,10 +294,10 @@ DB パスはワークスペースローカル（例 `.sui/memory.sqlite`）か�
 | 残した | 捨てた / 後回し |
 | --- | --- |
 | 原子的カード + FTS5 抽出 + トークン予算 | 履歴全体の LLM 要約を正本にすること |
-| 符号を明示した BM25（FTS はより負が良い） | ノート用 Tantivy、埋め込み、ハイブリッドベクトル |
+| ノートは FTS5 の順位、コードは `Bm25Index`。混ぜない | ノート用 Tantivy、埋め込み、二つの BM25 の生スコア加算 |
 | リンクは任意。CTE は深さ 2 と LIMIT | 書き込みのたびに既存ノートを LLM で進化させる A-Mem |
 | 選択 + 連結を promote と呼ぶ | 抽出後の LLM 再合成 |
-| 実行時 SQL、bundled SQLite | sqlx コンパイル時マクロ、`sqlx-cli`、Postgres |
+| rusqlite 同期、bundled SQLite、TUI スレッドが接続を所有 | sqlx、`tokio-rusqlite`、`spawn_blocking`、接続プール、Postgres |
 | 捕獲はホスト規則から | 重要度スコアの学習、タグ分類器 |
 | メモリ crate を履歴・コード検索・journal から分離 | モデルにページインさせる MemGPT ツール一式 |
 
@@ -269,10 +309,11 @@ DB パスはワークスペースローカル（例 `.sui/memory.sqlite`）か�
 | --- | --- | --- |
 | 捕獲がゴミを書く | FTS がゴミを返す | ホスト規則。ツールダンプをカードにしない。上限件数 |
 | MATCH 構文エラー | 自然文を FTS クエリに直入れ | ホスト側トークン化。失敗時は recency フォールバック |
-| 符号の混同 | FTS bm25 と `Bm25Index` | 融合は RRF。生スコアを足さない |
+| 二つの BM25 を足す | 符号・IDF・トークンが違う | エンジンを分けたまま。融合するなら順位の RRF だけ |
 | CTE 爆発 | 密なリンク + UNION ALL | 深さ 2、LIMIT、UNION、リンクを稀にする |
 | 二重の真実 | カードとディスク上のコードがずれる | カードにパスを書き、詳細は `code_search` / 将来の `read` に任せる。メモリは規範と決定、コードはツール |
 | flake | bundled SQLite が C を要求 | `mkShellNoCC` をやめるか、メモリ crate だけ `clang` を足す |
+| 接続をスレッド間で共有 | `Connection` は `!Sync` | TUI が一個所有。ツール化したらワーカーは別接続。`Arc<Connection>` は作らない |
 | 遅延 | 毎ターンの抽出 SQL | ノート数が 10^5 未満なら FTS はミリ秒。問題にならない |
 
 コードの真実はメモリに置かない。置いた瞬間、リポジトリが正本でなくなる。カードは「なぜそうしたか」「何を試してダメだったか」「ユーザー制約」に限る。
@@ -295,7 +336,7 @@ DB パスはワークスペースローカル（例 `.sui/memory.sqlite`）か�
 - `cargo clippy --workspace --all-targets -- --deny warnings`
 - `cargo fmt --all`
 
-sqlx/rusqlite を足す PR では `nix flake check` が C ツールチェイン無しで落ちないことを先に確認する。
+rusqlite bundled を足す PR では `nix flake check` が C ツールチェイン無しで落ちないことを先に確認する。
 
 ## 足す順番
 
@@ -309,8 +350,9 @@ sqlx/rusqlite を足す PR では `nix flake check` が C ツールチェイン�
 
 ## 参照
 
-- [SQLite FTS5](https://www.sqlite.org/fts5.html) — `bm25()`、`rank`、MATCH 構文
+- [SQLite FTS5](https://www.sqlite.org/fts5.html) — `bm25()` の `-1` 倍、Robertson IDF、フレーズ単位、`rank`
 - [SQLite WITH](https://www.sqlite.org/lang_with.html) — recursive CTE、UNION とサイクル、LIMIT / ORDER BY
+- [rusqlite `Connection`](https://docs.rs/rusqlite/latest/rusqlite/struct.Connection.html) — `Send + !Sync`、既定 `SQLITE_OPEN_NOMUTEX`
 - [A-Mem: Agentic Memory for LLM Agents](https://arxiv.org/html/2502.12110v2) — Zettelkasten 着想。書き込み時進化は過剰
-- 実装の隣接: `sui-app/src/app.rs`（`chat_history`）、`sui-app/src/input.rs`（system を一度だけ積む）、`sui-agent/src/lib.rs`（履歴を全部 sample）、`sui-tools/src/bm25.rs`（符号が逆の BM25）、`sui-workflow/src/journal.rs`（意味メモリではない）
+- 実装の隣接: `sui-app/src/app.rs`（`chat_history`）、`sui-app/src/llm.rs`（OS スレッド + current-thread tokio）、`sui-tools/src/bm25.rs`（Lucene 系 IDF、大きいほど良い）、`sui-tools/src/tool.rs`（`code_search` は Future の中の同期検索）、`sui-workflow/src/journal.rs`（意味メモリではない）
 - 先行調査: [`docs/research/agent-tools.md`](agent-tools.md)
