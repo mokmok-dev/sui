@@ -1,0 +1,316 @@
+# Zettelkasten 着想のメモリエンジン
+
+調査対象: セッション横断の LLM コンテキスト管理。構想は fleeting note の永続化と promote（再合成）による次回プロンプト組み立て。技術候補は SQLite、sqlx、recursive CTE、FTS5 スコアリング。
+現状: `sui-app` の `chat_history` はターンごとに置換され、上限も圧縮もない。検索は `sui-tools` のコード向け BM25 / Tantivy。永続ジャーナルは `sui-workflow` の再生ログ。
+
+## 結論
+
+設計は **実現可能** だが、そのまま全部を最初から作る必要はない。解くべき問題は一つだけである。
+
+**次の sample に載せるトークン列を、有限予算で組み立てる。**
+
+「重要なものを残し、それ以外を忘れる」はホストが解けない問題である。何が重要かは次のユーザー発話が決める。転換は正しい。忘却は削除ではなく、**今回の予算に選ばれなかった**ことである。
+
+SQLite + FTS5 はその抽出に足りる。recursive CTE はリンクを持つときだけ 1–2 hop の近傍拡大に使う。sqlx のコンパイル時クエリ検査は後回し。Tantivy をノート用に二重に持たない。埋め込みも持たない。
+
+最初に実装すべきは「カードの袋 + FTS 抽出 + 予算カット」である。Zettelkasten の語彙、進化するノート、LLM による promote 再合成は、抽出がプロンプトを実際に短くしてから足す。
+
+```mermaid
+flowchart TD
+  turn[session turn] --> capture[atomic capture]
+  capture --> store[(SQLite notes + links)]
+  next[next user prompt] --> seed[FTS5 seed]
+  store --> seed
+  seed --> hops["CTE 1-2 hop expand"]
+  hops --> score[fused score + token budget]
+  score --> assemble[working set]
+  assemble --> sample[sample]
+  sample --> turn
+```
+
+## 第一原理
+
+モデルはトークンしか見ない。ディスクもセッションも持たない。ホストはディスクを持つが、次の発話で何が必要かは知らない。
+
+分解すると三つの操作になる。混同してはいけない。
+
+| 操作 | 質問 | 今の sui |
+| --- | --- | --- |
+| 捕獲 | このターンから何をディスクに残すか | 何も残さない。`chat_history` が RAM で伸びる |
+| 抽出 | 次の予算にどのカードを載せるか | 全部載せる |
+| 組み立て | 選んだカードをどのメッセージ列にするか | `Vec<ChatMessage>` をそのまま送る |
+
+他エージェントの「記憶 / 忘却」は、この三つを一つの要約パスに畳んでいる。要約は不可逆なので、次のターンで必要だった細部を復元できない。カードにして抽出にすると、捨てたのはプロンプトからであってディスクからではない。
+
+Luhmann / Ahrens の Zettelkasten で fleeting note は **捨ててよい受信箱** である。永久ノートがリンクされた知識である。構想の「fleeting を永続化し promote する」は語彙が逆立ちしている。残す実体はカード（atomic claim）であり、fleeting は未処理の受信箱だけに使う。promote は「永久ノート化」ではなく **今回の working set に入れる** ことである。語を混ぜると、書き込み時の LLM 再書きと読み取り時の抽出が一つの動詞になる。
+
+A-Mem（Xu et al., NeurIPS 2025）は同じ着想を、書き込み時に LLM で注釈・リンク・既存ノート更新まで行う。それは別の問題（蓄積時にグラフを育てる）を解いている。コーディングエージェントの主問題は蓄積の豊かさではなく、**ツール結果で膨らんだ履歴を次の sample から外す**ことである。書き込み時 LLM は後回し。
+
+```mermaid
+flowchart LR
+  subgraph needed [needed to close the loop]
+    cards[atomic cards on disk]
+    retrieve[lexical retrieve into budget]
+    drop[omit raw history from wire]
+  end
+  subgraph extra [solves a different problem]
+    evolve[rewrite old notes on every write]
+    embed[vector similarity]
+    resynth[LLM promote rewrite]
+    fullzk[Luhmann IDs and folgezettel]
+  end
+  cards --> retrieve --> drop
+```
+
+## 現状（sui がすでに持っているもの）
+
+コンテキストは三箇所に分かれている。メモリエンジンは四つ目を足すので、既存の三つを乗っ取らない。
+
+```mermaid
+flowchart TB
+  app["sui-app chat_history"]
+  tools["sui-tools BM25 / Tantivy"]
+  journal["sui-workflow Journal"]
+  notes["proposed: note store"]
+  sample[sample]
+  app --> sample
+  tools -->|"code_search hits"| sample
+  notes -->|"working-set cards"| sample
+  journal -.->|"replay identity, not semantics"| app
+```
+
+- `App::chat_history` は最初のエージェントターンで `system_prompt(cwd)` を先頭に置き、`Done` で完全置換する。失敗時はユーザー行を楽観的に積まない。上限はない。ツール結果は履歴に残る。
+- `code_search` はワークスペースのソースに対する語彙検索である。ノートではない。トークナイザは ASCII / camelCase / snake_case。Tantivy は同じトークン列の永続インデックス。
+- `Journal` はワークフローの content-hash 再生である。意味検索の対象ではない。ノートストアと混ぜると、チェックサム不変条件が壊れる。
+
+メモリはツールループの外側にある。`run_turn` が `messages` を全部送る前提を、ホストが「短い working set を渡す」に変える。ツール契約（name + schema + execute）は触らない。
+
+## 他エージェントが解いている別の問題
+
+| 手法 | 解いている問題 | カード抽出との関係 |
+| --- | --- | --- |
+| 履歴を全部送る（今の sui、初期の多くの CLI） | 実装が最短 | 予算を食い潰す。忘れる手段がない |
+| compaction / 要約（Claude Code、Pi、多くのハーネス） | 窓が溢れる前に履歴を短くする | 不可逆。細部が要るターンで失敗する |
+| 常時注入 MEMORY.md / CLAUDE.md | ユーザーが書いた規範を毎回見せる | カードではない。短い standing orders には残してよい |
+| MemGPT / Letta の階層メモリ | モデルにページイン・アウトさせる | ツールが増える。抽出をモデルに委任する |
+| ベクトル RAG | 言い換えに強い類似検索 | ローカルコーディングの識別子・エラー文には語彙の方が強い。sui はすでに BM25 を選んでいる |
+| A-Mem の進化グラフ | 書き込み時にノート網を更新する | 毎ターン LLM。コーディングのツールダンプ圧縮には過剰 |
+
+「重要な情報を残しそれ以外を忘れる」は compaction の問いである。構想の転換（どれを promote するか）は抽出の問いである。両方必要になったら、抽出のあとに古い working set だけ要約すればよい。要約を正本にしない。
+
+## データモデル（最小）
+
+カードは一文の主張である。会話ログのスライスではない。ログを残すなら別テーブルにし、検索対象にしない。
+
+```text
+note
+  id            INTEGER PK
+  body          TEXT NOT NULL     -- 人間が読める原子的主張
+  kind          TEXT NOT NULL     -- claim / decision / constraint / open
+  session_id    TEXT
+  created_ms    INTEGER NOT NULL
+  source_hash   TEXT              -- 任意。どのターン由来か
+
+link
+  src           INTEGER NOT NULL
+  dst           INTEGER NOT NULL
+  rel           TEXT NOT NULL     -- cites / contradicts / follows
+  PRIMARY KEY (src, dst, rel)
+
+note_fts        FTS5(body, kind)  -- content=note または外部 content
+```
+
+これ以上の列（タグ配列、埋め込み、folgezettel 番号、inbox フラグの山）は、抽出クエリがそれを読まない限り削除対象である。
+
+リンクは **抽出が近傍を使うときだけ** 書く。書き込み時に LLM で「関連ノートを探せ」は A-Mem であり、最初は FTS で既存カードを引き、ヒットした id に `cites` を張る程度で足りる。リンクが空なら CTE は動かない。それでよい。
+
+## 抽出：FTS5 シード + 任意の CTE + 融合スコア
+
+SQLite FTS5 は仮想テーブルに転置インデックスを持ち、補助関数 `bm25()` と隠れ列 `rank` を返す。**数値が小さい（より負）ほど良い**。`sui-tools` の `Bm25Index` は大きいほど良い。符号を混ぜると順位が逆になる。
+
+`ORDER BY rank` は `ORDER BY bm25(table)` より速い（SQLite ドキュメント）。列ウェイトが要るときだけ `bm25(note_fts, w_body, w_kind)` を使う。
+
+シードはユーザー発話（と直近のカード本文）を FTS クエリにした MATCH である。FTS5 クエリ言語は AND/OR/NOT/フレーズ/プレフィックスを持つ。モデルが出した自然文をそのまま MATCH に渡すと構文エラーになる。クエリはホストがトークン化する。コード検索と同じ ASCII トークナイザをノートにも使うか、FTS5 の `unicode61` に任せるかは実装時に一つに決める。混ぜない。
+
+recursive CTE はグラフを全走査するためではない。FTS で得た id 集合を起点に、深さ 1–2、行数 LIMIT 付きで隣接を足す。
+
+SQLite の制約（公式 `WITH` ドキュメント）:
+
+- サイクルは `UNION`（重複行を捨てる）で止める。`UNION ALL` は無限ループしうる。
+- 重複排除のため `UNION` は生成行を保持する。ホップと LIMIT を先に付ける。
+- recursive-select の `ORDER BY` は探索順（BFS/DFS、新しい方優先）を変えられる。
+- recursive-select の `LIMIT` は再帰テーブルに入る行数の上限になる。
+- デフォルトの再帰深度は大きく取れるが、コーディングノートでは深さ 2 で打ち切る。深いほどノイズが増える。
+
+スコアは一つの関数にしない。スケールが違う。
+
+| 信号 | 向き | 由来 |
+| --- | --- | --- |
+| FTS `rank` | より負が良い | 語彙一致 |
+| `exp(-λ * depth)` | リンク距離 | CTE |
+| `1 / (1 + age_hours)` | 新しさ | `created_ms` |
+| session 一致 | バイナリ | 同じセッション |
+
+融合は Reciprocal Rank Fusion（各ランキングの `1/(k+rank)` を足す）が実装が短い。重み付き和は正規化を間違える。RRF は「FTS の負の bm25 を 0–1 に潰す」作業を避ける。
+
+予算カットはトークン概算（文字数 / 4 で足りる。正確な tokenizer は後）で上から詰める。system prompt と **今のユーザー発話** は常に残す。カードは user メッセージの前に、短いブロックとして足す。assistant/tool の生ログは載せない。それが忘却である。
+
+```mermaid
+flowchart TD
+  q[user prompt tokens] --> tok[host tokenize]
+  tok --> match["note_fts MATCH"]
+  match --> seedIds[top N ids]
+  seedIds --> cte["WITH RECURSIVE hops <= 2"]
+  cte --> rrf[RRF + recency]
+  rrf --> cap[token budget]
+  cap --> msgs["system + promoted cards + user"]
+```
+
+## 技術選定
+
+### SQLite
+
+ノートは小さく、トランザクションが要り、グラフと全文が同じファイルに載る。プロセス内、依存ゼロに近い、クラッシュ耐性は `journal_mode=WAL` + コミット時 `synchronous=NORMAL` でコーディング TUI には足りる。ワークフローの `fsync` 出力ゲートほど強くしなくてよい。ノートは再生同一性ではない。
+
+単一ライターを守る。TUI は LLM ワーカーを別スレッドで回している。DB はワーカー側か、チャンネル越しの一台の接続に閉じる。イベントループから直接書かない。
+
+### FTS5
+
+バンドル SQLite（sqlx `sqlite` / rusqlite `bundled`）は通常 FTS5 込みである。システム libsqlite に動的リンクすると、ディストロが FTS5 なしでビルドしていることがある。sui は flake / crane でビルドするので **バンドルを選ぶ**。その場合 C コンパイラが要る。
+
+今の `flake.nix` の `devShells.default` は `mkShellNoCC` で、crane の `commonArgs` に `nativeBuildInputs` がない。sqlx/rusqlite の bundled SQLite を足すと、**flake に `clang`（と必要なら `pkg-config`）を足す**のが前提条件になる。これはメモリ設計ではなくビルド設計のコストである。無視できない。
+
+日本語本文は FTS5 `unicode61` の方がデフォルト ASCII トークナイザよりましである。コード識別子は既存 `tokenize` の前処理を FTS 投入前にかける。本文種でトークナイザを切り替えない。前処理を一系統にする。
+
+### recursive CTE
+
+sqlx からも rusqlite からもただの SQL である。ドライバ制約はない。制約はクエリ設計側（サイクル、LIMIT、深さ）にある。
+
+リンク表が空、または抽出がシードだけで予算を埋めるなら、CTE を走らせない。グラフは最適化ではない。リンクが無い抽出を遅くするだけである。
+
+### sqlx
+
+sqlx を選ぶ理由は普通、コンパイル時の `query!` である。FTS5 仮想テーブルと recursive CTE はその旨味が薄い。
+
+- `query!` は検証用 DB とスキーマが要る。FTS5 は仮想テーブルなので、マクロの型推論が普通の表より弱い。
+- 実行時の `sqlx::query` ならコンパイル時検査は使っていない。そのとき sqlx は非同期とマクロ基盤のコストだけ残る。
+- sui の LLM 経路は already `tokio` current-thread なので非同期自体は障害ではない。
+- ワークスペースは `unsafe_code = deny` だが、依存 crate の unsafe は対象外。sqlx-sqlite / libsqlite3-sys は内部で unsafe を使う。 rusqlite も同じ。
+
+**推奨:** ノート crate のクエリは実行時 SQL で書く。最初のドライバは rusqlite（同期、bundled、FTS5 の実例が多い）か sqlx の runtime query のどちらでもよい。コンパイル時マクロ、`sqlx-cli`、`.sqlx` オフラインキャッシュ、`DATABASE_URL` は自動化の先行であり、スキーマが固まるまで持たない。
+
+sqlx に寄せるなら `features = ["runtime-tokio", "sqlite"]`（bundled）に閉じる。Postgres を「将来」で有効化しない。ノートはローカルファイルである。
+
+## 捕獲：誰が「重要」を決めるか
+
+抽出より捕獲の方が難しい。SQLite は助けない。
+
+候補をdumb順に並べ、上から試す。
+
+1. **ホスト規則。** ユーザー発話、ファイルパス、`edit` 成功、明示の決定文。ツールの生 stdout はカードにしない。実装が短い。再現できる。
+2. **モデルがツールで書く。** `note_write(body, kind)` をレジストリに足す。モデルは残さない。プロンプトに「残せ」と書くと、残すこと自体がタスクになる。
+3. **ターン後の LLM 抽出。** 別 sample で主張を抜き出す。品質は上がりうる。毎ターンのコストと失敗（幻覚カード）が乗る。
+
+最初は 1 だけにする。2 はループが閉じたあとの任意ツール。3 は評価セット（「この失敗は前のセッションの制約を忘れた」）が取れてから。
+
+カード本文の規則: ファイルパスと制約は具体的に。会話の要約は書かない。要約は compaction に戻る。
+
+## promote（再合成）をどこまでやるか
+
+構想の promote は「選んだ fleeting から次回プロンプトを再合成する」である。合成には二段階ある。
+
+| 段階 | 中身 | 最初に要るか |
+| --- | --- | --- |
+| 選択 | スコア順に予算へ入れる | 要る。これが忘却の定義 |
+| 整形 | カードを `## notes` ブロックで連結する | 要る。コード数行 |
+| 再書き | LLM にカードを一つの briefing に書き換えさせる | 不要。情報を減らし、遅延と幻覚を足す |
+
+再書きが必要になるのは、カード同士が矛盾し、モデルが両方を同時に信じたときである。そのときは矛盾リンク `contradicts` を抽出し、新しいカードを足す。古いカードを消さない。削除は履歴を消すのと同じ失敗である。
+
+working set のメッセージ形は、system を汚さない。カードは user の直前の一つの user メッセージ、または先頭付近の専用 user/assistant 対にする。system にカードを混ぜると、standing orders と事実が毎回入れ替わる。既存の短い `system_prompt` は残す。
+
+## ワークスペースへの置き方
+
+新しい crate（仮に `sui-memory`）がストアと抽出を持つ。`sui-agent` は `messages` の組み立てをホストに残す。`sui-app` がターン前後に呼ぶ。
+
+```mermaid
+flowchart TB
+  app[sui-app]
+  mem[sui-memory]
+  agent[sui-agent]
+  tools[sui-tools]
+  app -->|"prompt"| mem
+  mem -->|"working messages"| agent
+  agent --> tools
+  app -->|"turn done: capture"| mem
+```
+
+`sui-tools` の Tantivy にノートを載せない。コーパスポリシー（拡張子、サイズ上限、symlink）がノートと違う。インデックス破壊（`index_tree` はディレクトリを消して作り直す）もノート永続と両立しない。
+
+DB パスはワークスペースローカル（例 `.sui/memory.sqlite`）かユーザーキャッシュ。gitignore する。ワークフロー checkpoint とファイルを共有しない。
+
+## Musk の 5 ステップで削った結果
+
+| 残した | 捨てた / 後回し |
+| --- | --- |
+| 原子的カード + FTS5 抽出 + トークン予算 | 履歴全体の LLM 要約を正本にすること |
+| 符号を明示した BM25（FTS はより負が良い） | ノート用 Tantivy、埋め込み、ハイブリッドベクトル |
+| リンクは任意。CTE は深さ 2 と LIMIT | 書き込みのたびに既存ノートを LLM で進化させる A-Mem |
+| 選択 + 連結を promote と呼ぶ | 抽出後の LLM 再合成 |
+| 実行時 SQL、bundled SQLite | sqlx コンパイル時マクロ、`sqlx-cli`、Postgres |
+| 捕獲はホスト規則から | 重要度スコアの学習、タグ分類器 |
+| メモリ crate を履歴・コード検索・journal から分離 | モデルにページインさせる MemGPT ツール一式 |
+
+「just in case」で残さないもの: folgezettel 番号、inbox ワークフロー UI、複数トークナイザ、ノートの git 同期、暗号化、マルチプロセスリーダー向けの複雑な WAL 運用。
+
+## リスク
+
+| リスク | 中身 | 緩和 |
+| --- | --- | --- |
+| 捕獲がゴミを書く | FTS がゴミを返す | ホスト規則。ツールダンプをカードにしない。上限件数 |
+| MATCH 構文エラー | 自然文を FTS クエリに直入れ | ホスト側トークン化。失敗時は recency フォールバック |
+| 符号の混同 | FTS bm25 と `Bm25Index` | 融合は RRF。生スコアを足さない |
+| CTE 爆発 | 密なリンク + UNION ALL | 深さ 2、LIMIT、UNION、リンクを稀にする |
+| 二重の真実 | カードとディスク上のコードがずれる | カードにパスを書き、詳細は `code_search` / 将来の `read` に任せる。メモリは規範と決定、コードはツール |
+| flake | bundled SQLite が C を要求 | `mkShellNoCC` をやめるか、メモリ crate だけ `clang` を足す |
+| 遅延 | 毎ターンの抽出 SQL | ノート数が 10^5 未満なら FTS はミリ秒。問題にならない |
+
+コードの真実はメモリに置かない。置いた瞬間、リポジトリが正本でなくなる。カードは「なぜそうしたか」「何を試してダメだったか」「ユーザー制約」に限る。
+
+## 検証の仕方（実装するとき）
+
+エンジンを書く前に、失敗の形を固定する。
+
+1. セッション A で制約をカード化する（例: edit はバイト一致、bash は one-shot）。
+2. `chat_history` を捨てる。
+3. セッション B のプロンプトが制約に触れなくても、抽出が該当カードを working set に入れる。
+4. 無関係なカードは予算に入らない。
+5. ツールの長い stdout はカードにもプロンプトにも残らない。
+
+回帰は SQL とトークナイザで足りる。LLM をテストに挟まない。捕獲規則と FTS クエリと予算カットは決定的にできる。
+
+ワークスペース検証コマンドは現状どおり:
+
+- `cargo test --workspace`
+- `cargo clippy --workspace --all-targets -- --deny warnings`
+- `cargo fmt --all`
+
+sqlx/rusqlite を足す PR では `nix flake check` が C ツールチェイン無しで落ちないことを先に確認する。
+
+## 足す順番
+
+ループは「短い working set で sample できる」までが閉じる条件である。
+
+1. `sui-memory`: SQLite スキーマ、insert、FTS MATCH、予算カット、テスト。CTE なし。
+2. flake に bundled SQLite 用の C ツールチェイン。
+3. `sui-app`: ターン後にホスト規則で捕獲。ターン前に抽出して `chat_history` の代わりに working set を渡す。直近ユーザー発話は必ず残す。
+4. リンク表と深さ 2 CTE。RRF。評価セットでシード単独より良いときだけ残す。良くなければ CTE を削除する。
+5. 任意の `note_write` ツール。LLM 再合成は、矛盾カードが実害になってから。
+
+## 参照
+
+- [SQLite FTS5](https://www.sqlite.org/fts5.html) — `bm25()`、`rank`、MATCH 構文
+- [SQLite WITH](https://www.sqlite.org/lang_with.html) — recursive CTE、UNION とサイクル、LIMIT / ORDER BY
+- [A-Mem: Agentic Memory for LLM Agents](https://arxiv.org/html/2502.12110v2) — Zettelkasten 着想。書き込み時進化は過剰
+- 実装の隣接: `sui-app/src/app.rs`（`chat_history`）、`sui-app/src/input.rs`（system を一度だけ積む）、`sui-agent/src/lib.rs`（履歴を全部 sample）、`sui-tools/src/bm25.rs`（符号が逆の BM25）、`sui-workflow/src/journal.rs`（意味メモリではない）
+- 先行調査: [`docs/research/agent-tools.md`](agent-tools.md)
