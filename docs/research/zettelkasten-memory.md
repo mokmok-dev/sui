@@ -15,6 +15,8 @@ SQLite + FTS5 はその抽出に足りる。ドライバは rusqlite の同期 A
 
 `code_search` の Okapi/Lucene 系 BM25 と FTS5 の `bm25()` は **同名の別物** である。符号、IDF、トークン、コーパス、クエリ単位が違う。スコアを共有・加算・共通トレイト化しない。抽出の融合が要るなら順位だけを RRF する。
 
+コード検索を同じ SQLite ファイルに載せることは **検討の余地がある**。ただしコンテキスト組み立てのためにコード本文をノートと JOIN してプロンプトへ先入れするためではない。相乗りの単位はエンジン（rusqlite + 別テーブル + 明示の indexing フェーズ）であり、ランキングでも FTS 表でもない。ノート抽出が閉じてから、起動時 `index_tree` と Tantivy を畳む理由が残っているときだけやる。
+
 最初に実装すべきは「カードの袋 + FTS 抽出 + 予算カット」である。Zettelkasten の語彙、進化するノート、LLM による promote 再合成は、抽出がプロンプトを実際に短くしてから足す。
 
 ```mermaid
@@ -187,6 +189,61 @@ flowchart TD
 
 融合が必要なら **順位** だけを RRF する。`rank` の -3.2 と `SearchHit.score` の 12.4 を足すと、符号と IDF の差が順位を壊す。
 
+## `code_search` の SQLite 相乗り
+
+「コンテキスト組み立ての都合でコード検索も SQLite に載せ、indexing フェーズを新設してリライトする」は、問いが二つ混ざっている。分けてから残す。
+
+組み立てが今必要としているのは、カードの working set である。`code_search` はターン中のツールである。ヒットは `role: tool` で履歴に入る。ホストが sample 前にソース本文を JOIN して載せる必要はない。カードにパスがあれば、モデルがツールで読む。コードの正本をプロンプトに先入れするのは、ツールループを RAG に戻すことである。その都合だけではリライトしない。
+
+相乗りを検討してよい本当の理由は、組み立ての JOIN ではなく **索引の置き場** である。
+
+今の `code_search` はすでに indexing フェーズを持っている。名前が無いだけである。起動時に `Bm25Index::index_tree` がディスクを歩き、RAM に最大 10 000 件積む。Tantivy は同じ walk の永続版だが、`index_tree` がディレクトリを消して作り直す。起動のたびに全走査するか、破壊的な再ビルドか、のどちらかである。rusqlite をノートのために払ったあと、同じコストをもう一つの転置インデックスに払う理由は薄い。
+
+```mermaid
+flowchart TB
+  walk["visit_code_files"]
+  ram["Bm25Index RAM"]
+  tv["Tantivy dir"]
+  sqlite["SQLite file_fts"]
+  notes["SQLite note_fts"]
+  walk --> ram
+  walk --> tv
+  walk -.->|"candidate"| sqlite
+  capture[note capture] --> notes
+  sqlite --- notes
+```
+
+残してよい相乗り:
+
+| 載せる | 載せない |
+| --- | --- |
+| 同じ DB ファイルの **別テーブル** `file` / `file_fts` | ノートとソースを一つの FTS 表にする |
+| indexing フェーズが `file_*` だけを差分更新する | 再インデックスでノートを DROP する |
+| 投入前に既存 `tokenize` で識別子分割（Tantivy と同じ前処理） | FTS5 既定トークナイザにコードを直入れして camelCase を捨てる |
+| カードのパスから `file.path` を解決する CTE（id だけ） | 解決したファイル本文を working set に自動注入する |
+| `code_search` は `file_fts MATCH` の順位を返す | `note_fts.rank` と `file_fts.rank` を足す |
+
+indexing フェーズ（コード側）の最小契約:
+
+```text
+file
+  path          TEXT PRIMARY KEY
+  content_hash  TEXT NOT NULL
+  snippet       TEXT
+  indexed_ms    INTEGER NOT NULL
+
+file_fts        FTS5(path, tokens)   -- tokens = tokenize(source) を空白結合
+```
+
+1. `visit_code_files` は今のコーパスポリシーのまま（拡張子、1 MiB、secret、symlink なし、`target` スキップ）。
+2. パスごとに content hash を見て、変わった行だけ UPSERT する。消えたパスは `file` から消す。`note*` は触らない。
+3. クエリはホストが `tokenize` してから MATCH する。コード検索の識別子分割は残る。順位は FTS5 側に移るので、Lucene 系 IDF の数値は捨てる。ヒットの **パス集合** が回帰の対象である。スコアの絶対値は対象にしない。
+4. 起動は「DB を開く」。初回または hash 不一致のときだけ walk する。これが indexing フェーズを名前付きにする意味である。
+
+時期。ノートの袋が working set を短くする前にコード検索を載せ替えると、メモリ設計が「索引が古い」「FTS の順位が変わった」に巻き込まれる。先にカード抽出を閉じる。そのあと、起動時 walk が soreness として残る、または Tantivy と RAM 索引が両方生きている、なら SQLite に畳む。Tantivy は永続語彙索引として重複になるので、そのとき削除対象である。`Bm25Index` はユニットテストと DB 無しの煙テストに残してよい。
+
+ワーカーと TUI。`code_search` は LLM ワーカー上で同期に走る。ノート接続は TUI が所有する案と衝突する。相乗りするなら、**ファイルを共有し接続はスレッドごとに開く**（WAL）。TUI のノート接続とワーカーの検索接続は別ハンドルである。一つの `Connection` を `ToolRegistry` に `Arc` しない。
+
 ## 技術選定
 
 ### SQLite
@@ -285,7 +342,7 @@ flowchart TB
   app -->|"turn done: capture"| mem
 ```
 
-`sui-tools` の Tantivy にノートを載せない。コーパスポリシー（拡張子、サイズ上限、symlink）がノートと違う。インデックス破壊（`index_tree` はディレクトリを消して作り直す）もノート永続と両立しない。
+`sui-tools` の Tantivy にノートを載せない。コーパスポリシー（拡張子、サイズ上限、symlink）がノートと違う。インデックス破壊（`index_tree` はディレクトリを消して作り直す）もノート永続と両立しない。逆方向（コードを SQLite に載せる）は上の「相乗り」節。同じファイルならよく、同じ FTS 表ならよくない。
 
 DB パスはワークスペースローカル（例 `.sui/memory.sqlite`）かユーザーキャッシュ。gitignore する。ワークフロー checkpoint とファイルを共有しない。
 
@@ -294,10 +351,10 @@ DB パスはワークスペースローカル（例 `.sui/memory.sqlite`）か�
 | 残した | 捨てた / 後回し |
 | --- | --- |
 | 原子的カード + FTS5 抽出 + トークン予算 | 履歴全体の LLM 要約を正本にすること |
-| ノートは FTS5 の順位、コードは `Bm25Index`。混ぜない | ノート用 Tantivy、埋め込み、二つの BM25 の生スコア加算 |
+| ノートは `note_fts`、コードは今は `Bm25Index`。のちに別テーブルなら可 | 同一 FTS 表、生スコア加算、ソース本文の自動注入、ノートを消す再インデックス |
 | リンクは任意。CTE は深さ 2 と LIMIT | 書き込みのたびに既存ノートを LLM で進化させる A-Mem |
 | 選択 + 連結を promote と呼ぶ | 抽出後の LLM 再合成 |
-| rusqlite 同期、bundled SQLite、TUI スレッドが接続を所有 | sqlx、`tokio-rusqlite`、`spawn_blocking`、接続プール、Postgres |
+| rusqlite 同期、bundled SQLite、TUI スレッドがノート接続を所有 | sqlx、`tokio-rusqlite`、`spawn_blocking`、接続プール、Postgres |
 | 捕獲はホスト規則から | 重要度スコアの学習、タグ分類器 |
 | メモリ crate を履歴・コード検索・journal から分離 | モデルにページインさせる MemGPT ツール一式 |
 
@@ -310,6 +367,8 @@ DB パスはワークスペースローカル（例 `.sui/memory.sqlite`）か�
 | 捕獲がゴミを書く | FTS がゴミを返す | ホスト規則。ツールダンプをカードにしない。上限件数 |
 | MATCH 構文エラー | 自然文を FTS クエリに直入れ | ホスト側トークン化。失敗時は recency フォールバック |
 | 二つの BM25 を足す | 符号・IDF・トークンが違う | エンジンを分けたまま。融合するなら順位の RRF だけ |
+| 再インデックスがノートを消す | 同じ DB をコード walk が DROP する | `file_*` だけ更新。ノート表は indexing の対象外 |
+| ソースを working set に JOIN する | ツールを RAG に戻す | カードはパスまで。本文は `code_search` / 将来の `read` |
 | CTE 爆発 | 密なリンク + UNION ALL | 深さ 2、LIMIT、UNION、リンクを稀にする |
 | 二重の真実 | カードとディスク上のコードがずれる | カードにパスを書き、詳細は `code_search` / 将来の `read` に任せる。メモリは規範と決定、コードはツール |
 | flake | bundled SQLite が C を要求 | `mkShellNoCC` をやめるか、メモリ crate だけ `clang` を足す |
@@ -347,6 +406,7 @@ rusqlite bundled を足す PR では `nix flake check` が C ツールチェイ�
 3. `sui-app`: ターン後にホスト規則で捕獲。ターン前に抽出して `chat_history` の代わりに working set を渡す。直近ユーザー発話は必ず残す。
 4. リンク表と深さ 2 CTE。RRF。評価セットでシード単独より良いときだけ残す。良くなければ CTE を削除する。
 5. 任意の `note_write` ツール。LLM 再合成は、矛盾カードが実害になってから。
+6. 起動時 walk か Tantivy 重複が soreness として残るなら、`file` / `file_fts` と差分 indexing フェーズ。`code_search` をそこに挿す。ノート表は触らない。パス集合の回帰が前の `Bm25Index` と一致することを先に測る。
 
 ## 参照
 
@@ -354,5 +414,5 @@ rusqlite bundled を足す PR では `nix flake check` が C ツールチェイ�
 - [SQLite WITH](https://www.sqlite.org/lang_with.html) — recursive CTE、UNION とサイクル、LIMIT / ORDER BY
 - [rusqlite `Connection`](https://docs.rs/rusqlite/latest/rusqlite/struct.Connection.html) — `Send + !Sync`、既定 `SQLITE_OPEN_NOMUTEX`
 - [A-Mem: Agentic Memory for LLM Agents](https://arxiv.org/html/2502.12110v2) — Zettelkasten 着想。書き込み時進化は過剰
-- 実装の隣接: `sui-app/src/app.rs`（`chat_history`）、`sui-app/src/llm.rs`（OS スレッド + current-thread tokio）、`sui-tools/src/bm25.rs`（Lucene 系 IDF、大きいほど良い）、`sui-tools/src/tool.rs`（`code_search` は Future の中の同期検索）、`sui-workflow/src/journal.rs`（意味メモリではない）
+- 実装の隣接: `sui/src/main.rs`（起動時 `index_tree`）、`sui-tools/src/corpus.rs`（walk ポリシー）、`sui-tools/src/tantivy_index.rs`（前処理トークン + 破壊的再ビルド）、`sui-tools/src/bm25.rs`（Lucene 系 IDF）、`sui-app/src/llm.rs`（OS スレッド + current-thread tokio）、`sui-workflow/src/journal.rs`（意味メモリではない）
 - 先行調査: [`docs/research/agent-tools.md`](agent-tools.md)
