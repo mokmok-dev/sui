@@ -16,18 +16,34 @@
 
 システムプロンプトは「いつ使うか」だけを短く書く。**どう使うか**はスキーマ側に置く。
 
-```text
-user message
-    │
-    ▼
-sample(messages, tools) ── tool_calls 空? ── yes ──► assistant text（終了）
-    ▲                         │
-    │                         no
-    │                         ▼
-    └──────── append role:tool ◄── ToolRegistry::call
+```mermaid
+flowchart TD
+  user[user message] --> sample["sample(messages, tools)"]
+  sample --> empty{"tool_calls empty?"}
+  empty -->|yes| text[assistant text]
+  empty -->|no| exec["ToolRegistry::call"]
+  exec --> append["append role: tool"]
+  append --> sample
 ```
 
 LiteLLM がプロバイダ差を吸収する。sui は OpenAI Chat Completions の形だけ話せばよい。
+
+```mermaid
+sequenceDiagram
+  participant TUI as sui-app
+  participant Agent as sui-agent
+  participant LLM as model
+  participant Tools as sui-tools
+
+  TUI->>Agent: run_turn(user)
+  Agent->>LLM: chat_with_tools(messages, specs)
+  LLM-->>Agent: tool_calls
+  Agent->>Tools: call(name, args)
+  Tools-->>Agent: JSON result
+  Agent->>LLM: assistant_tools + role tool
+  LLM-->>Agent: assistant text
+  Agent-->>TUI: Done history
+```
 
 ## 第一原理
 
@@ -39,12 +55,32 @@ LiteLLM がプロバイダ差を吸収する。sui は OpenAI Chat Completions �
 
 この契約より厚いものは、別の問題を解いている。
 
+```mermaid
+flowchart LR
+  subgraph needed [needed to close the loop]
+    wire["tools / tool_calls"]
+    exec["name + schema + execute"]
+    feed["role: tool back to model"]
+  end
+  subgraph extra [solves a different problem]
+    acp[ACP / leader / Hub]
+    fuzzy[9-layer fuzzy edit]
+    wrap[3-layer ToolDefinition]
+    dedicated["read / grep / write"]
+  end
+  wire --> exec --> feed
+  acp -.->|multi-client| extra
+  fuzzy -.->|whitespace recovery| extra
+  wrap -.->|UI metadata| extra
+  dedicated -.->|permissions / subagents| extra
+```
+
 | 厚い層 | 解いている問題 | ツール実行に必要か |
 | --- | --- | --- |
 | ACP / leader / Computer Hub | 複数クライアントが一つのエージェントを共有する | 不要 |
 | 9 段の fuzzy edit | モデルが空白を少し間違えてもパッチを当てる | 不要（失敗をモデルに返せばよい） |
 | 3 層の `ToolDefinition` ラップ | UI ラベル・レンダラ・コア実行を分ける | 不要（既存 `Tool` で足りる） |
-| 専用 `grep` / `read` / `write` | 読み取り専用サブエージェントや権限分割 | ループを閉じるには不要 |
+| 専用 `grep` / `read` / `write` | 読み取り専用サブエージェントや権限分割 | ループを閉じるには不要。次の改善では足す |
 
 ## 3 製品の比較
 
@@ -59,9 +95,38 @@ LiteLLM がプロバイダ差を吸収する。sui は OpenAI Chat Completions �
 5. 結果を履歴に足す。
 6. モデルがテキストで止めるまで繰り返す。
 
+```mermaid
+flowchart TD
+  ctx[build context] --> sample[sample or stream]
+  sample --> parse[extract tool_calls]
+  parse --> has{"any calls?"}
+  has -->|no| stop[assistant text]
+  has -->|yes| run[host executes]
+  run --> hist[append tool results]
+  hist --> sample
+```
+
 ### Grok Build
 
 [xai-org/grok-build](https://github.com/xai-org/grok-build) はハーネス全体がプロダクトである。TUI はエージェントの内部 API ではなく、[Agent Client Protocol (ACP)](https://agentclientprotocol.com/) のクライアントとして話す。
+
+```mermaid
+flowchart TB
+  subgraph clients [faces]
+    tui[TUI pager]
+    ide[editor]
+    headless[headless / CI]
+  end
+  acp[ACP JSON-RPC]
+  subgraph brain [xai-grok-shell]
+    session[sessions / turn loop]
+  end
+  tools[xai-grok-tools]
+  hub[Computer Hub]
+  clients --> acp --> session
+  session --> tools
+  session --> hub
+```
 
 - `xai-grok-pager` — TUI（顔）
 - `xai-grok-shell` — セッション、ターン、ツール糊、leader
@@ -78,15 +143,28 @@ OpenCode も同じ `tools` / `tool_calls` ループを回す。ツール集合�
 
 edit は 9 段の fallback で SEARCH を探す。
 
-1. 完全一致
-2. 行 trim
-3. 先頭・末尾行アンカー + 中間類似度
-4. 空白正規化
-5. インデント無視
-6. エスケープ正規化
-7. ブロック境界 trim
-8. 周辺コンテキスト
-9. 複数出現
+```mermaid
+flowchart TD
+  start[SEARCH text] --> p1[1 exact]
+  p1 -->|miss| p2[2 line trim]
+  p2 -->|miss| p3[3 block anchors]
+  p3 -->|miss| p4[4 whitespace]
+  p4 -->|miss| p5[5 indentation]
+  p5 -->|miss| p6[6 escapes]
+  p6 -->|miss| p7[7 boundary trim]
+  p7 -->|miss| p8[8 context]
+  p8 -->|miss| p9[9 multi-occurrence]
+  p1 -->|hit| apply[replace]
+  p2 -->|hit| apply
+  p3 -->|hit| apply
+  p4 -->|hit| apply
+  p5 -->|hit| apply
+  p6 -->|hit| apply
+  p7 -->|hit| apply
+  p8 -->|hit| apply
+  p9 -->|hit| apply
+  p9 -->|miss| err["error: not found"]
+```
 
 これは「モデルが空白を少し間違えてもファイルを壊さず直す」ための最適化である。
 曖昧一致は誤置換の原因にもなる（OpenCode 自身の issue でも指摘されている）。
@@ -95,6 +173,17 @@ sui の `edit` はバイト完全一致の `SEARCH` / `REPLACE` ブロックで�
 ### pi-agent-core
 
 [pi-mono](https://github.com/badlogic/pi-mono) は層が薄い。
+
+```mermaid
+flowchart TB
+  coding[pi-coding-agent]
+  core[pi-agent-core]
+  ai[pi-ai]
+  tui[pi-tui]
+  coding --> core
+  coding --> tui
+  core --> ai
+```
 
 | パッケージ | 役割 |
 | --- | --- |
@@ -129,29 +218,31 @@ Musk の 5 ステップで削った結果。
 
 責務を 4 crate に分けた。TUI は実行しない。ループは `sui-agent` が所有する。
 
-```text
-sui (binary)
-  indexes cwd (BM25: rs, toml, md, rhai)
-  App::with_llm + App::with_tools(coding_registry)
+```mermaid
+flowchart TB
+  bin["sui binary"]
+  app[sui-app]
+  agent[sui-agent]
+  llm[sui-llm]
+  tools[sui-tools]
+  model[LiteLLM / OpenAI]
+  fs[filesystem / shell]
 
-sui-app
-  prompt → agent_spawn（tools あり）
-        → chat_stream_spawn（tools なし）
-  LlmStreamMsg::{Chunk, Tool, Done, Failed}
-  Done で chat_history を置換（楽観的 push しない）
-
-sui-agent
-  run_turn: sample → execute → append → repeat
-  specs_from_registry / system_prompt / AgentEvent
-
-sui-llm
-  ToolSpec / ToolCall / Role::Tool
-  chat_with_tools → OpenAI Chat Completions
-
-sui-tools
-  ToolRegistry::call
-  coding_registry = code_search + edit + bash(optional)
+  bin -->|"index cwd + coding_registry"| app
+  app -->|"prompt with tools"| agent
+  app -->|"prompt without tools"| llm
+  agent --> llm
+  agent --> tools
+  llm --> model
+  tools --> fs
+  app -.->|"AgentEvent / LlmStreamMsg"| agent
 ```
+
+- `sui`: cwd を BM25 で索引（`rs`, `toml`, `md`, `rhai`）。`App::with_llm` + `App::with_tools(coding_registry)`
+- `sui-app`: tools ありなら `agent_spawn`、なしなら `chat_stream_spawn`。`Done` で `chat_history` を置換（楽観的 push しない）
+- `sui-agent`: `run_turn` が sample → execute → append を繰り返す
+- `sui-llm`: `ToolSpec` / `ToolCall` / `Role::Tool`。`chat_with_tools`
+- `sui-tools`: `ToolRegistry::call`。`coding_registry` = `code_search` + `edit` + `bash`（任意）
 
 ### ワイヤ（`sui-llm`）
 
@@ -192,6 +283,46 @@ LLM が設定されているときだけインデックスして `with_tools` �
 エージェント sample は非 stream。タイムアウト 10 分。
 失敗・中断でユーザー行を pop しないよう、履歴は `Done` の置換だけが正本。
 
+## 次に足すツール
+
+ループは閉じている。足りないのは **正確な読み取り・新規作成・生きたテキスト検索** である。`bash` の `cat` / `rg` / heredoc で代用すると、行番号・上限・gitignore・原子的書き込みが消える。
+
+```mermaid
+flowchart LR
+  q1["name unknown?"] -->|yes| cs[code_search BM25]
+  q1 -->|no| q2["need exact line?"]
+  q2 -->|yes| grep[grep live disk]
+  q2 -->|no| cs
+  grep --> readFile["read path + offset + limit"]
+  cs --> readFile
+  readFile --> q3{"new file?"}
+  q3 -->|yes| writeFile["write path + content"]
+  q3 -->|no| editFile["edit SEARCH/REPLACE"]
+```
+
+`code_search` と `grep` は分けた方がよい。質問が違う。
+
+| ツール | 質問 | 今 |
+| --- | --- | --- |
+| `code_search` | 認証まわりはどこ？（ランキング、スナップショット） | ある |
+| `grep` | この文字列は何行目？（正規表現、生きたディスク、gitignore） | なし。`ignore` + 検索 crate で内蔵する |
+| `read` | このファイルの N 行から M 行（1始まり、行番号付き、行数とバイトの二重キャップ） | なし。`cat` 代用 |
+| `write` | この path に content を書く（新規・上書き） | なし。`edit` は既存の正確な置換だけ |
+| `edit` | 既存ファイルのバイト一致置換 | ある |
+
+他エージェントの `read` はほぼ同じ契約に収束している（OpenCode / pi / Claude Code）。
+
+```mermaid
+flowchart TD
+  readCall["read(path, offset?, limit?)"] --> open[open file]
+  open --> slice["slice 1-indexed lines"]
+  slice --> cap{line or byte cap?}
+  cap -->|ok| out["n: line"]
+  cap -->|hit| partial["n: line + next_offset"]
+```
+
+足す順番: `read` → `write` → `grep`。`code_search` は残す。glob / ls は読み取り専用サブエージェントを切るときでよい。
+
 ## 検証
 
 - `cargo test --workspace`
@@ -204,7 +335,7 @@ LLM が設定されているときだけインデックスして `with_tools` �
 
 - ツール使用ターンのトークン単位 stream
 - 実行前 permission プロンプト
-- 専用 `grep` / `read` / `write`
+- 専用 `grep` / `read` / `write`（上の「次に足すツール」）
 - ACP やサブエージェント
 
 ## 参照
