@@ -5,7 +5,8 @@
 //! [`Mode::Prompt`]; Esc cancels without running. Add variants here when
 //! subagent / workflow surfaces exist; do not infer mode from input prefixes.
 
-use ratatui::style::{Color, Style};
+use ratatui::style::Style;
+use sui_theme::Theme;
 
 /// Active interaction mode.
 ///
@@ -31,18 +32,16 @@ impl Mode {
         }
     }
 
-    /// Border style (foreground color) for the prompt widget in this mode.
+    /// Border style (foreground color) for the prompt widget in this mode,
+    /// derived from the active `theme`.
     #[must_use]
-    pub fn border_style(self) -> Style {
-        Style::default().fg(self.border_color())
-    }
-
-    /// Border foreground color for the prompt widget in this mode.
-    #[must_use]
-    pub const fn border_color(self) -> Color {
+    pub fn border_style(
+        self,
+        theme: Theme,
+    ) -> Style {
         match self {
-            Self::Prompt => Color::Cyan,
-            Self::Shell => Color::Magenta,
+            Self::Prompt => theme.prompt_style(),
+            Self::Shell => theme.shell_style(),
         }
     }
 }

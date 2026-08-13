@@ -4,6 +4,7 @@ members = [
   "sui-agent",
   "sui-app",
   "sui-llm",
+  "sui-theme",
   "sui-tools",
   "sui-widget",
   "sui-workflow",
@@ -28,11 +29,13 @@ sha2 = "0.11.0"
 sui-agent = { path = "./sui-agent" }
 sui-app = { path = "./sui-app" }
 sui-llm = { path = "./sui-llm" }
+sui-theme = { path = "./sui-theme" }
 sui-tools = { path = "./sui-tools" }
 sui-widget = { path = "./sui-widget" }
 sui-workflow = { path = "./sui-workflow" }
 thiserror = "2.0.20"
 tokio = "1.53.1"
+toml = "0.8"
 unicode-width = "0.2.2"
 wiremock = "0.6.5"
 

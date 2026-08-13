@@ -1,5 +1,6 @@
 use sui_app::App;
 use sui_llm::LlmClient;
+use sui_theme::config;
 use sui_tools::{Bm25Index, coding_registry};
 use thiserror::Error;
 
@@ -15,7 +16,7 @@ pub(crate) enum MainError {
 async fn main() -> Result<(), MainError> {
     color_eyre::install().map_err(MainError::from)?;
 
-    let mut app = App::new();
+    let mut app = App::new().with_theme(config::load_active());
     match LlmClient::from_env() {
         Ok(client) => {
             let cwd = std::env::current_dir().ok();

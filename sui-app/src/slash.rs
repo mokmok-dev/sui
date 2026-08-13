@@ -1,10 +1,5 @@
 use crate::App;
-use ratatui::{
-    Frame,
-    layout::Rect,
-    style::{Color, Style},
-    widgets::Paragraph,
-};
+use ratatui::{Frame, layout::Rect, style::Style, widgets::Paragraph};
 
 pub const MAX_CANDIDATES: usize = 5;
 
@@ -88,7 +83,7 @@ impl App {
         frame: &mut Frame,
         area: Rect,
     ) {
-        let selected_style = Style::default().fg(Color::Black).bg(Color::Yellow);
+        let selected_style = self.theme.selected_style();
         let normal_style = Style::default();
 
         for (i, candidate) in self.slash_candidates.iter().enumerate() {
