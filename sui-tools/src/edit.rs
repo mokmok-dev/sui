@@ -75,10 +75,16 @@ struct ApproxMatch {
 /// `haystack`). Only called on the "not found" error path to widen the
 /// diagnostic beyond the plain preview. It never decides correctness — the
 /// strict byte-exact unique match in [`apply_blocks`] is unchanged.
-fn closest_match(haystack: &str, search: &str) -> ApproxMatch {
+fn closest_match(
+    haystack: &str,
+    search: &str,
+) -> ApproxMatch {
     let h = haystack.as_bytes();
     let s = search.as_bytes();
-    let mut best = ApproxMatch { offset: 0, matched: 0 };
+    let mut best = ApproxMatch {
+        offset: 0,
+        matched: 0,
+    };
     for start in 0..=h.len().saturating_sub(1) {
         let matched = h[start..]
             .iter()
@@ -86,7 +92,10 @@ fn closest_match(haystack: &str, search: &str) -> ApproxMatch {
             .take_while(|(a, b)| a == b)
             .count();
         if matched > best.matched {
-            best = ApproxMatch { offset: start, matched };
+            best = ApproxMatch {
+                offset: start,
+                matched,
+            };
         }
     }
     best
@@ -94,7 +103,11 @@ fn closest_match(haystack: &str, search: &str) -> ApproxMatch {
 
 /// Quotes the expected vs found bytes at the first divergence of `matched`,
 /// so the message shows *why* (e.g. a trailing space) rather than only where.
-fn divergence_detail(haystack: &str, search: &str, matched: &ApproxMatch) -> String {
+fn divergence_detail(
+    haystack: &str,
+    search: &str,
+    matched: &ApproxMatch,
+) -> String {
     let expected = search.as_bytes().get(matched.matched);
     let found = haystack.as_bytes().get(matched.offset + matched.matched);
     match (expected, found) {
@@ -103,7 +116,10 @@ fn divergence_detail(haystack: &str, search: &str, matched: &ApproxMatch) -> Str
             matched.offset + matched.matched
         ),
         (Some(&e), None) => {
-            format!("at byte {} expected {e:?} but reached end of file", matched.matched)
+            format!(
+                "at byte {} expected {e:?} but reached end of file",
+                matched.matched
+            )
         },
         (None, Some(&f)) => format!(
             "after {} matching bytes found {f:?} (search text is shorter than the file)",
