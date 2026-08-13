@@ -60,6 +60,59 @@ static SEARCH_REPLACE_RE: LazyLock<Result<Regex, regex::Error>> =
 /// Max length of a SEARCH preview embedded in a "not found" error.
 const SEARCH_PREVIEW_CHARS: usize = 80;
 
+/// The closest byte-exact prefix of `search` found in `haystack`.
+struct ApproxMatch {
+    /// Byte offset in `haystack` where the closest prefix starts.
+    offset: usize,
+    /// Number of haystack bytes consumed by the matching prefix.
+    matched: usize,
+}
+
+/// Finds the position in `haystack` whose prefix matches `search` for the
+/// longest run of bytes before the first divergence.
+///
+/// Always yields a result (the loop runs at least once, even for an empty
+/// `haystack`). Only called on the "not found" error path to widen the
+/// diagnostic beyond the plain preview. It never decides correctness — the
+/// strict byte-exact unique match in [`apply_blocks`] is unchanged.
+fn closest_match(haystack: &str, search: &str) -> ApproxMatch {
+    let h = haystack.as_bytes();
+    let s = search.as_bytes();
+    let mut best = ApproxMatch { offset: 0, matched: 0 };
+    for start in 0..=h.len().saturating_sub(1) {
+        let matched = h[start..]
+            .iter()
+            .zip(s.iter())
+            .take_while(|(a, b)| a == b)
+            .count();
+        if matched > best.matched {
+            best = ApproxMatch { offset: start, matched };
+        }
+    }
+    best
+}
+
+/// Quotes the expected vs found bytes at the first divergence of `matched`,
+/// so the message shows *why* (e.g. a trailing space) rather than only where.
+fn divergence_detail(haystack: &str, search: &str, matched: &ApproxMatch) -> String {
+    let expected = search.as_bytes().get(matched.matched);
+    let found = haystack.as_bytes().get(matched.offset + matched.matched);
+    match (expected, found) {
+        (Some(&e), Some(&f)) => format!(
+            "at byte {} expected {e:?} but found {f:?}",
+            matched.offset + matched.matched
+        ),
+        (Some(&e), None) => {
+            format!("at byte {} expected {e:?} but reached end of file", matched.matched)
+        },
+        (None, Some(&f)) => format!(
+            "after {} matching bytes found {f:?} (search text is shorter than the file)",
+            matched.offset + matched.matched
+        ),
+        (None, None) => String::new(),
+    }
+}
+
 /// One `SEARCH` / `REPLACE` block parsed from an LLM reply.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchReplaceBlock {
@@ -115,7 +168,9 @@ pub fn parse_search_replace_blocks(response: &str) -> Result<Vec<SearchReplaceBl
 ///
 /// Returns [`ToolsError::Edit`] when a block has empty SEARCH text, when the
 /// SEARCH text appears zero times (byte-exact), or when it appears more than
-/// once (ambiguous).
+/// once (ambiguous). A zero-match error reports the closest overlapping prefix
+/// and the first expected-vs-found byte divergence to guide the follow-up
+/// edit.
 pub fn apply_blocks(
     content: &str,
     blocks: &[SearchReplaceBlock],
@@ -134,9 +189,13 @@ pub fn apply_blocks(
         let start = {
             let mut matches = result.match_indices(&block.search);
             let (start, _) = matches.next().ok_or_else(|| {
+                let approx = closest_match(&result, &block.search);
                 block_error(
                     block_num,
-                    &format!("SEARCH text not found in file; preview: {preview:?}"),
+                    &format!(
+                        "SEARCH text not found in file; preview: {preview:?} — closest match {}",
+                        divergence_detail(&result, &block.search, &approx)
+                    ),
                 )
             })?;
             if matches.next().is_some() {
@@ -400,6 +459,47 @@ Done.";
         assert!(matches!(err, ToolsError::Edit(_)));
         assert!(err.to_string().contains("not found"), "{err}");
         assert!(err.to_string().contains("fn missing"), "{err}");
+    }
+
+    #[test]
+    fn unmatched_search_reports_closest_pos_and_divergence() {
+        // `fn other()` shares 3 bytes ("fn ") then diverges at 'o' vs 'm'.
+        let content = "fn other() {}";
+        let err = apply_blocks(
+            content,
+            &[SearchReplaceBlock {
+                search: "fn missing() {}".into(),
+                replace: "fn present() {}".into(),
+            }],
+        )
+        .expect_err("missing search");
+        let msg = err.to_string();
+        assert!(msg.contains("closest match"), "{msg}");
+        assert!(msg.contains("expected"), "{msg}");
+        assert!(msg.contains("found"), "{msg}");
+        // Divergence at byte 3: expected 'm' (109), found 'o' (111).
+        assert!(msg.contains("byte 3"), "{msg}");
+        assert!(msg.contains("expected 109"), "{msg}");
+        assert!(msg.contains("found 111"), "{msg}");
+    }
+
+    #[test]
+    fn unmatched_search_reports_trailing_space_divergence() {
+        // SEARCH has a trailing space; the file ends after the matching prefix.
+        let err = apply_blocks(
+            "fn a() {}",
+            &[SearchReplaceBlock {
+                search: "fn a() {} ".into(),
+                replace: "fn b() {}".into(),
+            }],
+        )
+        .expect_err("trailing space");
+        let msg = err.to_string();
+        assert!(msg.contains("expected"), "{msg}");
+        // Search len 10 bytes, matched 9, so divergence at byte 9: expected 32 (space).
+        assert!(msg.contains("byte 9"), "{msg}");
+        assert!(msg.contains("expected 32"), "{msg}");
+        assert!(msg.contains("end of file"), "{msg}");
     }
 
     #[test]
