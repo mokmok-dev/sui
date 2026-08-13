@@ -17,7 +17,7 @@ async fn main() -> Result<(), MainError> {
     color_eyre::install().map_err(MainError::from)?;
 
     let mut app = App::new().with_theme(config::load_active());
-    match LlmClient::from_env() {
+    match LlmClient::from_config_or_env() {
         Ok(client) => {
             let cwd = std::env::current_dir().ok();
             let index = cwd

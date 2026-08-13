@@ -79,7 +79,7 @@ fn enter_submits_and_clears() {
         message_texts(&app),
         vec![
             "a",
-            "llm not configured: set LITELLM_BASE_URL and LITELLM_MODEL (optional LITELLM_API_KEY)"
+            "llm not configured: set [llm] in config.toml or SUI_LLM_BASE_URL and SUI_LLM_MODEL (optional SUI_LLM_API_KEY)"
         ]
     );
 }
@@ -236,7 +236,7 @@ fn normal_text_still_adds_to_messages() {
         message_texts(&app),
         vec![
             "hello",
-            "llm not configured: set LITELLM_BASE_URL and LITELLM_MODEL (optional LITELLM_API_KEY)"
+            "llm not configured: set [llm] in config.toml or SUI_LLM_BASE_URL and SUI_LLM_MODEL (optional SUI_LLM_API_KEY)"
         ]
     );
 }
@@ -1181,11 +1181,7 @@ async fn prompt_with_llm_appends_assistant_reply_and_history() {
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .and(body_partial_json(json!({ "stream": true })))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .insert_header("content-type", "text/event-stream")
-                .set_body_string(sse),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_raw(sse.as_bytes(), "text/event-stream"))
         .mount(&server)
         .await;
 
@@ -1314,8 +1310,7 @@ async fn prompt_llm_waiting_shows_spinner_and_allows_typing() {
         .respond_with(
             ResponseTemplate::new(200)
                 .set_delay(Duration::from_millis(300))
-                .insert_header("content-type", "text/event-stream")
-                .set_body_string(sse),
+                .set_body_raw(sse.as_bytes(), "text/event-stream"),
         )
         // Quit abandons before the worker may have hit the server.
         .mount(&server)

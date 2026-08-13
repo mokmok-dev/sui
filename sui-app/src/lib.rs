@@ -24,9 +24,9 @@
 //!   back to Prompt without running; output is flushed as dim ghost text
 //!
 //! Attach a client with [`App::with_llm`] (typically
-//! [`sui_llm::LlmClient::from_env`] in the binary) and tools with
+//! [`sui_llm::LlmClient::from_config_or_env`] in the binary) and tools with
 //! [`App::with_tools`]. Without a client, prompt submits report a configuration
-//! error instead of calling the Proxy.
+//! error instead of calling the configured API.
 //!
 //! Future surfaces (subagent, workflow) should add [`Mode`] variants rather
 //! than new prefix heuristics.

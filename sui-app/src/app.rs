@@ -64,7 +64,7 @@ pub(crate) enum ScrollbackLine {
 /// use sui_llm::LlmClient;
 ///
 /// let mut app = App::new();
-/// if let Ok(client) = LlmClient::from_env() {
+/// if let Ok(client) = LlmClient::from_config_or_env() {
 ///     app = app.with_llm(client);
 /// }
 /// app.run_inline()?;
@@ -102,11 +102,11 @@ pub struct App {
     pub(crate) at_selected: usize,
     /// Lazily-walked workspace file list backing the `@`-mention picker.
     pub(crate) file_cache: Option<Vec<String>>,
-    /// Optional `LiteLLM` Proxy client for [`Mode::Prompt`] chat.
+    /// Optional OpenAI-compatible client for [`Mode::Prompt`] chat.
     pub(crate) llm: Option<LlmClient>,
     /// Tools advertised to the model when set ([`App::with_tools`]).
     pub(crate) tools: Option<sui_tools::ToolRegistry>,
-    /// Session chat turns sent to the Proxy (user + assistant + tool results).
+    /// Session chat turns sent to the OpenAI-compatible API (user + assistant + tool results).
     pub(crate) chat_history: Vec<ChatMessage>,
     /// Active LLM request (event loop polls; spinner animates until it lands).
     pub(crate) pending_llm: Option<PendingLlm>,
@@ -153,8 +153,8 @@ impl App {
     /// Attach an LLM client for prompt-mode chat.
     ///
     /// Without this, prompt submits surface a configuration hint instead of
-    /// calling the Proxy. Typical wiring:
-    /// `App::new().with_llm(LlmClient::from_env()?)`.
+    /// calling the configured API. Typical wiring:
+    /// `App::new().with_llm(LlmClient::from_config_or_env()?)`.
     #[must_use]
     pub fn with_llm(
         mut self,

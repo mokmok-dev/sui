@@ -158,14 +158,12 @@ where
     for _ in 0..options.max_turns {
         let response = sample_agent_completion(client, messages, &specs).await?;
         if response.tool_calls.is_empty() {
-            messages.push(ChatMessage::assistant(response.content.clone()));
+            messages.push(response.assistant_message());
             return Ok(response.content);
         }
-        messages.push(ChatMessage::assistant_tools(
-            response.content,
-            response.tool_calls.clone(),
-        ));
-        for call in response.tool_calls {
+        let tool_calls = response.tool_calls.clone();
+        messages.push(response.assistant_message());
+        for call in tool_calls {
             on_event(AgentEvent::ToolStart {
                 id: call.id.clone(),
                 name: call.name.clone(),

@@ -9,7 +9,7 @@ pub enum AgentError {
     /// The model kept requesting tools past the configured sample cap.
     #[error("agent turn limit reached ({0} samples)")]
     TurnLimit(usize),
-    /// The Proxy kept returning empty completions across bounded retries.
+    /// The API kept returning empty completions across bounded retries.
     #[error("model returned an empty response after {0} attempts")]
     EmptyResponse(usize),
     /// A call-site option failed validation.
