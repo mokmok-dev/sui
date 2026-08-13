@@ -538,7 +538,11 @@ impl App {
             match line {
                 ScrollbackLine::Prompt(text) => {
                     let rows = Self::padded_prompt_rows(text, &self.prompt_prefix, width as usize);
-                    Self::insert_wrapped_rows(terminal, &rows, Style::default().bg(PROMPT_FLUSH_BG))?;
+                    Self::insert_wrapped_rows(
+                        terminal,
+                        &rows,
+                        Style::default().bg(PROMPT_FLUSH_BG),
+                    )?;
                 },
                 ScrollbackLine::Ghost(text) => {
                     let rows = wrap_text(text, width as usize);
