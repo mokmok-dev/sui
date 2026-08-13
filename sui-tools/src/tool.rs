@@ -157,8 +157,8 @@ impl Tool for CodeSearchTool {
                 "query": { "type": "string", "description": "Search query" },
                 "limit": {
                     "type": "integer",
-                    "description": format!("Max hits to return (default 10, max {MAX_SEARCH_LIMIT})"),
-                    "minimum": 1,
+                    "description": format!("Max hits to return (default 10, max {MAX_SEARCH_LIMIT}; 0 returns no hits)"),
+                    "minimum": 0,
                     "maximum": MAX_SEARCH_LIMIT
                 }
             },
@@ -174,13 +174,7 @@ impl Tool for CodeSearchTool {
         Box::pin(async move {
             let args: CodeSearchArgs = serde_json::from_value(args)
                 .map_err(|error| ToolsError::InvalidArgs(error.to_string()))?;
-            let limit = match args.limit {
-                None => 10,
-                Some(0) => {
-                    return Err(ToolsError::InvalidArgs("limit must be >= 1".into()));
-                },
-                Some(n) => n.min(MAX_SEARCH_LIMIT),
-            };
+            let limit = args.limit.unwrap_or(10).min(MAX_SEARCH_LIMIT);
             let hits = self.index.search(&args.query, limit);
             Ok(json!({ "hits": hits }))
         })
@@ -756,8 +750,9 @@ mod tests {
 
         let zero_limit = registry
             .call("code_search", json!({ "query": "x", "limit": 0 }))
-            .await;
-        assert!(matches!(zero_limit, Err(ToolsError::InvalidArgs(_))));
+            .await
+            .expect("limit=0 should succeed");
+        assert_eq!(zero_limit["hits"].as_array().expect("hits").len(), 0);
 
         let unknown_field = registry
             .call("code_search", json!({ "query": "x", "extra": true }))
