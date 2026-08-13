@@ -82,16 +82,26 @@
               inherit cargoArtifacts;
             };
 
-          mkTest = name: lib.nameValuePair "${name}-test" (craneLib.cargoTest (individualCrateArgs name));
-
+          # Packages only need to produce the binary; the workspace-wide `test`
+          # check below is the single owner of test execution. Running `cargo
+          # test -p <crate>` in every package's checkPhase would rebuild the
+          # shared dependency graph once per crate (cargo fingerprints do not
+          # survive the differing sandbox source paths), which is what made the
+          # old per-crate check derivations so slow.
           mkPkg =
             name:
             craneLib.buildPackage (
-              individualCrateArgs name // lib.optionalAttrs (name == "sui") { inherit version; }
+              individualCrateArgs name
+              // lib.optionalAttrs (name == "sui") { inherit version; }
+              // {
+                doCheck = false;
+              }
             );
         in
         {
-          checks = builtins.listToAttrs (map mkTest crates);
+          checks = {
+            test = craneLib.cargoTest (commonArgs // { inherit cargoArtifacts; });
+          };
 
           packages = builtins.listToAttrs (map (name: lib.nameValuePair name (mkPkg name)) crates) // {
             default = self'.packages.sui;
