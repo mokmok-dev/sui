@@ -39,6 +39,15 @@ impl StreamingMarkdown {
         self.events.extend(self.parser.flush());
     }
 
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn render_buffer_lines(
+        &self,
+        width: usize,
+    ) -> Vec<Line<'static>> {
+        render_markdown(&self.buffer, width).lines
+    }
+
     #[must_use]
     pub(crate) fn line_count(
         &self,

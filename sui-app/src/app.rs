@@ -115,6 +115,8 @@ impl Default for App {
 }
 
 impl App {
+    pub(crate) const POLL_DRAIN_BUDGET: usize = 256;
+
     /// Creates a new `App` with the default prompt prefix (`"❯ "`).
     #[must_use]
     pub fn new() -> Self {
@@ -438,22 +440,23 @@ impl App {
 
     /// Non-blocking check for an in-flight LLM response.
     pub(crate) fn poll_pending_llm(&mut self) {
-        let msg = {
-            let Some(pending) = &self.pending_llm else {
-                return;
+        for _ in 0..Self::POLL_DRAIN_BUDGET {
+            let msg = {
+                let Some(pending) = &self.pending_llm else {
+                    return;
+                };
+                match pending.rx.try_recv() {
+                    Ok(msg) => msg,
+                    Err(TryRecvError::Empty) => return,
+                    Err(TryRecvError::Disconnected) => {
+                        crate::llm::LlmStreamMsg::Failed("llm worker disconnected".into())
+                    },
+                }
             };
-            match pending.rx.try_recv() {
-                Ok(msg) => Some(msg),
-                Err(TryRecvError::Empty) => None,
-                Err(TryRecvError::Disconnected) => Some(crate::llm::LlmStreamMsg::Failed(
-                    "llm worker disconnected".into(),
-                )),
+            if self.handle_stream_msg(msg) {
+                self.pending_llm = None;
+                return;
             }
-        };
-        if let Some(msg) = msg
-            && self.handle_stream_msg(msg)
-        {
-            self.pending_llm = None;
         }
     }
 

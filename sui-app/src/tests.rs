@@ -1,9 +1,11 @@
 use super::{App, Mode, PROMPT_HEIGHT, char_index_to_byte};
-use crate::app::ScrollbackLine;
+use crate::app::{PendingLlm, ScrollbackLine};
+use crate::llm::LlmStreamMsg;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::backend::{Backend, TestBackend};
 use ratatui::layout::Position;
 use ratatui::{Terminal, TerminalOptions, Viewport};
+use std::sync::mpsc;
 
 fn message_texts(app: &App) -> Vec<&str> {
     app.messages
@@ -957,6 +959,177 @@ fn teardown_inline_clears_viewport_and_resets_cursor() {
             );
         }
     }
+}
+
+fn pending_app(
+    messages: impl IntoIterator<Item = LlmStreamMsg>
+) -> (App, mpsc::Sender<LlmStreamMsg>) {
+    let (tx, rx) = mpsc::channel();
+    for msg in messages {
+        assert!(tx.send(msg).is_ok());
+    }
+    let mut app = App::new();
+    app.pending_llm = Some(PendingLlm::new(rx));
+    (app, tx)
+}
+
+fn rendered_streaming_text(app: &App) -> String {
+    app.streaming_reply
+        .as_ref()
+        .map(|reply| {
+            reply
+                .render_buffer_lines(80)
+                .iter()
+                .flat_map(|line| line.spans.iter())
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        })
+        .unwrap_or_default()
+}
+
+#[test]
+fn poll_pending_llm_drains_queued_chunks() {
+    use sui_llm::ChatResponse;
+
+    let (mut app, _tx) = pending_app([
+        LlmStreamMsg::Chunk("foo".into()),
+        LlmStreamMsg::Chunk("bar".into()),
+        LlmStreamMsg::Done {
+            response: ChatResponse::new("final-reply", "test-model"),
+            history: Vec::new(),
+        },
+    ]);
+    app.poll_pending_llm();
+
+    assert!(app.pending_llm.is_none());
+    assert_eq!(
+        app.messages,
+        vec![ScrollbackLine::Reply("final-reply".into())]
+    );
+}
+
+#[test]
+fn poll_pending_llm_stops_draining_after_terminal_message() {
+    use sui_llm::ChatResponse;
+
+    let (mut app, _tx) = pending_app([
+        LlmStreamMsg::Chunk("before".into()),
+        LlmStreamMsg::Done {
+            response: ChatResponse::new("final-reply", "test-model"),
+            history: Vec::new(),
+        },
+        LlmStreamMsg::Chunk("after-terminal".into()),
+    ]);
+    app.poll_pending_llm();
+
+    assert!(app.pending_llm.is_none());
+    assert_eq!(
+        app.messages,
+        vec![ScrollbackLine::Reply("final-reply".into())]
+    );
+}
+
+#[test]
+fn poll_pending_llm_drains_chunks_without_done_and_keeps_pending() {
+    let (mut app, _tx) = pending_app([
+        LlmStreamMsg::Chunk("foo".into()),
+        LlmStreamMsg::Chunk("bar".into()),
+    ]);
+    app.poll_pending_llm();
+
+    assert!(app.pending_llm.is_some());
+    let rendered = rendered_streaming_text(&app);
+    assert!(rendered.contains("foobar"), "rendered={rendered:?}");
+}
+
+#[test]
+fn poll_pending_llm_budget_bounds_drain_and_preserves_order() {
+    let over_budget = App::POLL_DRAIN_BUDGET + 3;
+    let token = |i: usize| format!("chunk{i:03};");
+    let (mut app, _tx) = pending_app((0..over_budget).map(|i| LlmStreamMsg::Chunk(token(i))));
+
+    app.poll_pending_llm();
+    assert!(
+        app.pending_llm.is_some(),
+        "budget exhaustion must leave the request pending"
+    );
+
+    let after_first = rendered_streaming_text(&app);
+    for i in 0..App::POLL_DRAIN_BUDGET {
+        let chunk = token(i);
+        assert!(
+            after_first.contains(&chunk),
+            "expected budgeted chunk {chunk} after first poll: {after_first:?}"
+        );
+    }
+    for i in App::POLL_DRAIN_BUDGET..over_budget {
+        let chunk = token(i);
+        assert!(
+            !after_first.contains(&chunk),
+            "chunk {chunk} must not be drained until the next poll: {after_first:?}"
+        );
+    }
+
+    app.poll_pending_llm();
+    assert!(app.pending_llm.is_some());
+    let after_second = rendered_streaming_text(&app);
+    let mut last = 0usize;
+    for i in 0..over_budget {
+        let chunk = token(i);
+        let at = after_second
+            .find(&chunk)
+            .unwrap_or_else(|| panic!("missing chunk {chunk} after second poll: {after_second:?}"));
+        assert!(at >= last, "chunk {chunk} out of order: {after_second:?}");
+        last = at;
+    }
+}
+
+#[test]
+fn poll_pending_llm_handles_disconnect_after_draining_chunk() {
+    let (tx, rx) = mpsc::channel();
+    assert!(tx.send(LlmStreamMsg::Chunk("partial".into())).is_ok());
+    drop(tx);
+
+    let mut app = App::new();
+    app.pending_llm = Some(PendingLlm::new(rx));
+    app.poll_pending_llm();
+
+    assert!(app.pending_llm.is_none());
+    assert!(app.streaming_reply.is_none());
+    assert_eq!(app.messages.len(), 1);
+    assert!(
+        matches!(
+            &app.messages[0],
+            ScrollbackLine::Prompt(text)
+                if text.starts_with("llm error:") && text.contains("llm worker disconnected")
+        ),
+        "messages={:?}",
+        app.messages
+    );
+}
+
+#[test]
+fn poll_pending_llm_drains_tool_messages_before_done() {
+    use sui_llm::ChatResponse;
+
+    let (mut app, _tx) = pending_app([
+        LlmStreamMsg::Tool("tool bash: ok".into()),
+        LlmStreamMsg::Chunk("done".into()),
+        LlmStreamMsg::Done {
+            response: ChatResponse::new("done", "test-model"),
+            history: Vec::new(),
+        },
+    ]);
+    app.poll_pending_llm();
+
+    assert!(app.pending_llm.is_none());
+    assert_eq!(
+        app.messages,
+        vec![
+            ScrollbackLine::Ghost("tool bash: ok".into()),
+            ScrollbackLine::Reply("done".into()),
+        ]
+    );
 }
 
 #[tokio::test]
