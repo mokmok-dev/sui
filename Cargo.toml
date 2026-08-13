@@ -35,6 +35,7 @@ sui-widget = { path = "./sui-widget" }
 sui-workflow = { path = "./sui-workflow" }
 thiserror = "2.0.20"
 tokio = "1.53.1"
+toml = "0.8"
 unicode-width = "0.2.2"
 wiremock = "0.6.5"
 

@@ -32,12 +32,16 @@ impl Mode {
         }
     }
 
-    /// Border style (foreground color) for the prompt widget in this mode.
+    /// Border style (foreground color) for the prompt widget in this mode,
+    /// derived from the active `theme`.
     #[must_use]
-    pub fn border_style(self) -> Style {
+    pub fn border_style(
+        self,
+        theme: Theme,
+    ) -> Style {
         match self {
-            Self::Prompt => Theme::DEFAULT.prompt_style(),
-            Self::Shell => Theme::DEFAULT.shell_style(),
+            Self::Prompt => theme.prompt_style(),
+            Self::Shell => theme.shell_style(),
         }
     }
 }

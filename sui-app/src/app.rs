@@ -78,6 +78,8 @@ pub struct App {
     pub(crate) prompt_prefix: String,
     /// Sticky interaction mode (see [`Mode`]).
     pub(crate) mode: Mode,
+    /// Active colour palette for the UI.
+    pub(crate) theme: Theme,
     /// History of submitted prompts / status / ghost lines.
     ///
     /// New entries are committed above the inline viewport via
@@ -130,6 +132,7 @@ impl App {
             should_quit: false,
             prompt_prefix: "❯ ".to_string(),
             mode: Mode::Prompt,
+            theme: Theme::DEFAULT,
             messages: Vec::new(),
             flushed_messages: 0,
             viewport_height: PROMPT_HEIGHT,
@@ -289,6 +292,18 @@ impl App {
     /// use sui_app::App;
     /// let app = App::new().with_prompt_prefix("$ ");
     /// ```
+    /// Sets the active colour palette for the UI.
+    ///
+    /// Defaults to [`sui_theme::Theme::DEFAULT`].
+    #[must_use]
+    pub const fn with_theme(
+        mut self,
+        theme: Theme,
+    ) -> Self {
+        self.theme = theme;
+        self
+    }
+
     #[must_use]
     pub fn with_prompt_prefix(
         mut self,
@@ -535,11 +550,7 @@ impl App {
             match line {
                 ScrollbackLine::Prompt(text) => {
                     let rows = Self::padded_prompt_rows(text, &self.prompt_prefix, width as usize);
-                    Self::insert_wrapped_rows(
-                        terminal,
-                        &rows,
-                        Theme::DEFAULT.prompt_flush_style(),
-                    )?;
+                    Self::insert_wrapped_rows(terminal, &rows, self.theme.prompt_flush_style())?;
                 },
                 ScrollbackLine::Ghost(text) => {
                     let rows = wrap_text(text, width as usize);
@@ -668,7 +679,7 @@ impl App {
         let title = self.prompt_title_for_render();
         let prompt = PromptWidget::new(&self.input, self.cursor_position, &self.prompt_prefix)
             .with_title(&title)
-            .with_style(self.mode.border_style());
+            .with_style(self.mode.border_style(self.theme));
         let cursor_pos = prompt.screen_cursor(prompt_area);
         frame.render_widget(prompt, prompt_area);
         frame.set_cursor_position((cursor_pos.0, cursor_pos.1));

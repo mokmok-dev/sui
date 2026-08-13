@@ -1,9 +1,11 @@
 //! Central colour palette and derived styles for the sui TUI.
 //!
 //! Colours that appear on prompt / shell widgets and suggestion panels are
-//! defined here as consts so they read as one cohesive palette. Keeping them
-//! behind a single [`Theme`] value means they can later be overridden from
-//! configuration without touching call sites.
+//! defined here as consts so they read as one cohesive palette. The active
+//! palette can be selected from `config.toml` via [`config`]; call sites
+//! consume a [`Theme`] value so swapping the palette stays localised.
+
+pub mod config;
 
 use ratatui::style::{Color, Style};
 
@@ -27,16 +29,14 @@ pub struct Theme {
 }
 
 impl Theme {
-    /// The default palette.
-    ///
-    /// `prompt_background` is a mid grey — a lighter value reads as white on
-    /// many terminals and fails to separate past prompts from the scrollback.
+    /// The default palette, modelled on the dark variant of the
+    /// [iceberg](https://github.com/cocopon/iceberg.vim) colour scheme.
     pub const DEFAULT: Self = Self {
-        prompt_border: Color::Cyan,
-        shell_border: Color::Magenta,
-        prompt_background: Color::DarkGray,
-        selection_fg: Color::Black,
-        selection_bg: Color::Yellow,
+        prompt_border: Color::Rgb(0x84, 0xA0, 0xC6),
+        shell_border: Color::Rgb(0xA0, 0x93, 0xC7),
+        prompt_background: Color::Rgb(0x3D, 0x42, 0x5B),
+        selection_fg: Color::Rgb(0xEF, 0xF0, 0xF4),
+        selection_bg: Color::Rgb(0x5B, 0x63, 0x89),
     };
 
     /// Foreground-only border style for the interactive prompt widget.
@@ -70,15 +70,23 @@ mod tests {
 
     #[test]
     fn default_styles_carry_the_expected_colors() {
-        assert_eq!(Theme::DEFAULT.prompt_style().fg, Some(Color::Cyan));
-        assert_eq!(Theme::DEFAULT.shell_style().fg, Some(Color::Magenta));
+        assert_eq!(
+            Theme::DEFAULT.prompt_style().fg,
+            Some(Color::Rgb(0x84, 0xA0, 0xC6))
+        );
+        assert_eq!(
+            Theme::DEFAULT.shell_style().fg,
+            Some(Color::Rgb(0xA0, 0x93, 0xC7))
+        );
         assert_eq!(
             Theme::DEFAULT.prompt_flush_style().bg,
-            Some(Color::DarkGray)
+            Some(Color::Rgb(0x3D, 0x42, 0x5B))
         );
         assert_eq!(
             Theme::DEFAULT.selected_style(),
-            Style::default().fg(Color::Black).bg(Color::Yellow)
+            Style::default()
+                .fg(Color::Rgb(0xEF, 0xF0, 0xF4))
+                .bg(Color::Rgb(0x5B, 0x63, 0x89))
         );
     }
 }
