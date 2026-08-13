@@ -99,6 +99,11 @@
 
           devShells.default = pkgs.mkShellNoCC {
             inputsFrom = [ config.pre-commit.devShell ];
+            env = {
+              LITELLM_BASE_URL = "http://localhost:11434/v1";
+              LITELLM_API_KEY = "ollama";
+              LITELLM_MODEL = "gemma4:e4b";
+            };
             packages = [ rustToolchain ];
           };
 
