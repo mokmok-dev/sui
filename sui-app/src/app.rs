@@ -11,7 +11,7 @@ use ratatui::{
 };
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::Instant;
-use sui_llm::{ChatMessage, ChatResponse, LlmClient};
+use sui_llm::{ChatMessage, ChatResponse, LlmClient, LlmModel};
 use sui_theme::Theme;
 use sui_widget::{PROMPT_MIN_HEIGHT, PromptWidget, wrap_prefixed, wrap_text};
 
@@ -104,6 +104,10 @@ pub struct App {
     pub(crate) file_cache: Option<Vec<String>>,
     /// Optional OpenAI-compatible client for [`Mode::Prompt`] chat.
     pub(crate) llm: Option<LlmClient>,
+    /// Switchable models loaded from `[[model.<name>]]` config sections.
+    pub(crate) models: Vec<LlmModel>,
+    /// Active index into [`Self::models`], when named models are configured.
+    pub(crate) active_model: Option<usize>,
     /// Tools advertised to the model when set ([`App::with_tools`]).
     pub(crate) tools: Option<sui_tools::ToolRegistry>,
     /// Session chat turns sent to the OpenAI-compatible API (user + assistant + tool results).
@@ -143,6 +147,8 @@ impl App {
             at_selected: 0,
             file_cache: None,
             llm: None,
+            models: Vec::new(),
+            active_model: None,
             tools: None,
             chat_history: Vec::new(),
             pending_llm: None,
@@ -153,7 +159,8 @@ impl App {
     /// Attach an LLM client for prompt-mode chat.
     ///
     /// Without this, prompt submits surface a configuration hint instead of
-    /// calling the configured API. Typical wiring:
+    /// calling the configured API. This single-client mode clears any named
+    /// models previously attached with [`Self::with_models`]. Typical wiring:
     /// `App::new().with_llm(LlmClient::from_config_or_env()?)`.
     #[must_use]
     pub fn with_llm(
@@ -161,6 +168,28 @@ impl App {
         client: LlmClient,
     ) -> Self {
         self.llm = Some(client);
+        self.models.clear();
+        self.active_model = None;
+        self
+    }
+
+    /// Attach named models for `/model` switching.
+    ///
+    /// The first model becomes active immediately. Passing an empty list leaves
+    /// the current client unchanged and unregisters switchable models.
+    #[must_use]
+    pub fn with_models(
+        mut self,
+        models: Vec<LlmModel>,
+    ) -> Self {
+        let Some(first) = models.first() else {
+            self.models.clear();
+            self.active_model = None;
+            return self;
+        };
+        self.llm = Some(LlmClient::new(first.config()));
+        self.models = models;
+        self.active_model = Some(0);
         self
     }
 
