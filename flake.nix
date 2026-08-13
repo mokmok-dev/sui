@@ -14,11 +14,7 @@
       url = "github:oxalica/rust-overlay";
       inputs.nixpkgs.follows = "nixpkgs";
     };
-    rust-flake = {
-      url = "github:juspay/rust-flake";
-      inputs.nixpkgs.follows = "nixpkgs";
-      inputs.rust-overlay.follows = "rust-overlay";
-    };
+    crane.url = "github:ipetkov/crane";
   };
 
   outputs =
@@ -50,42 +46,61 @@
       imports = [
         inputs.treefmt-nix.flakeModule
         inputs.git-hooks.flakeModule
-        inputs.rust-flake.flakeModules.default
-        inputs.rust-flake.flakeModules.nixpkgs
       ];
 
       perSystem =
         {
           self',
-          pkgs,
           config,
           lib,
+          system,
           ...
         }:
-        {
-          checks = lib.mapAttrs' (
-            name: crate:
-            let
-              crane-lib = config.rust-project.crane-lib;
-              args = crate.crane.args // {
-                src = config.rust-project.src;
-                pname = name;
-                cargoExtraArgs = "-p ${name}";
-                strictDeps = true;
-              };
-              cargoArtifacts = crane-lib.buildDepsOnly args;
-            in
-            lib.nameValuePair "${name}-test" (crane-lib.cargoTest (args // { inherit cargoArtifacts; }))
-          ) config.rust-project.crates;
+        let
+          pkgs = import inputs.nixpkgs {
+            inherit system;
+            overlays = [ inputs.rust-overlay.overlays.default ];
+          };
+          rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
+          craneLib = (inputs.crane.mkLib pkgs).overrideToolchain rustToolchain;
+          src = craneLib.cleanCargoSource ./.;
+          commonArgs = {
+            inherit src;
+            pname = "sui-workspace";
+            strictDeps = true;
+          };
+          cargoArtifacts = craneLib.buildDepsOnly commonArgs;
 
-          devShells.default = pkgs.mkShellNoCC {
-            inputsFrom = [
-              config.pre-commit.devShell
-              self'.devShells.rust
-            ];
+          crates = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.members;
+
+          individualCrateArgs =
+            name:
+            commonArgs
+            // {
+              pname = name;
+              cargoExtraArgs = "-p ${name}";
+              inherit cargoArtifacts;
+            };
+
+          mkTest = name: lib.nameValuePair "${name}-test" (craneLib.cargoTest (individualCrateArgs name));
+
+          mkPkg =
+            name:
+            craneLib.buildPackage (
+              individualCrateArgs name // lib.optionalAttrs (name == "sui") { inherit version; }
+            );
+        in
+        {
+          checks = builtins.listToAttrs (map mkTest crates);
+
+          packages = builtins.listToAttrs (map (name: lib.nameValuePair name (mkPkg name)) crates) // {
+            default = self'.packages.sui;
           };
 
-          packages.default = self'.packages.sui;
+          devShells.default = pkgs.mkShellNoCC {
+            inputsFrom = [ config.pre-commit.devShell ];
+            packages = [ rustToolchain ];
+          };
 
           pre-commit.settings = {
             hooks = {
@@ -93,17 +108,8 @@
               deadnix.enable = true;
               statix = {
                 enable = true;
-                settings.ignore = [
-                  ".direnv/**"
-                ];
+                settings.ignore = [ ".direnv/**" ];
               };
-            };
-          };
-
-          rust-project = {
-            toolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
-            crates.sui.crane.extraBuildArgs = {
-              inherit version;
             };
           };
 
@@ -112,7 +118,7 @@
             programs = {
               nixfmt.enable = true;
               rustfmt.enable = true;
-              rustfmt.package = config.rust-project.toolchain;
+              rustfmt.package = rustToolchain;
               taplo.enable = true;
             };
           };
