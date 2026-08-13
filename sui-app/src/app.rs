@@ -5,7 +5,7 @@ use ratatui::{
     DefaultTerminal, Frame, Terminal, TerminalOptions, Viewport,
     backend::{Backend, CrosstermBackend},
     layout::{Constraint, Layout, Position},
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Text},
     widgets::{Paragraph, Widget},
 };
@@ -31,6 +31,13 @@ impl PendingLlm {
 
 /// Minimum rows occupied by the bordered prompt widget (single content line).
 pub const PROMPT_HEIGHT: u16 = PROMPT_MIN_HEIGHT;
+
+/// Pale-gray background applied to flushed prompt lines so that previously
+/// submitted prompts stand out from assistant replies in the scrollback.
+const PROMPT_FLUSH_BG: Color = Color::Gray;
+
+/// Number of blank rows padded above and below each flushed prompt line.
+const PROMPT_FLUSH_PADDING: usize = 1;
 
 /// Extra inline rows reserved while the slash-suggestion panel is open.
 ///
@@ -530,8 +537,8 @@ impl App {
             let line = &self.messages[self.flushed_messages];
             match line {
                 ScrollbackLine::Prompt(text) => {
-                    let rows = wrap_prefixed(text, &self.prompt_prefix, width as usize);
-                    Self::insert_wrapped_rows(terminal, &rows, Style::default())?;
+                    let rows = Self::padded_prompt_rows(text, &self.prompt_prefix, width as usize);
+                    Self::insert_wrapped_rows(terminal, &rows, Style::default().bg(PROMPT_FLUSH_BG))?;
                 },
                 ScrollbackLine::Ghost(text) => {
                     let rows = wrap_text(text, width as usize);
@@ -549,6 +556,21 @@ impl App {
             self.flushed_messages += 1;
         }
         Ok(())
+    }
+
+    /// Wraps a prompt to `max_width` and pads `PROMPT_FLUSH_PADDING` blank rows
+    /// above and below so it reads as a distinct block in the scrollback.
+    fn padded_prompt_rows(
+        text: &str,
+        prefix: &str,
+        max_width: usize,
+    ) -> Vec<String> {
+        let mut rows = wrap_prefixed(text, prefix, max_width);
+        for _ in 0..PROMPT_FLUSH_PADDING {
+            rows.insert(0, String::new());
+            rows.push(String::new());
+        }
+        rows
     }
 
     fn insert_wrapped_rows<B: Backend>(

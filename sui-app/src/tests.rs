@@ -4,6 +4,7 @@ use crate::llm::LlmStreamMsg;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::backend::{Backend, TestBackend};
 use ratatui::layout::Position;
+use ratatui::style::Color;
 use ratatui::{Terminal, TerminalOptions, Viewport};
 use std::sync::mpsc;
 
@@ -834,7 +835,8 @@ fn flush_reply_wraps_long_line() {
 
 #[test]
 fn flush_messages_writes_above_inline_viewport() {
-    let mut terminal = inline_test_terminal(40, 10, 4);
+    // height = 4 (cursor_y) + 6 (inserted rows) + 3 (viewport)
+    let mut terminal = inline_test_terminal(40, 13, 4);
 
     let mut app = App::new().with_prompt_prefix("> ");
     app.add_message("hello");
@@ -842,8 +844,9 @@ fn flush_messages_writes_above_inline_viewport() {
     infallible(app.flush_messages(&mut terminal));
 
     assert_eq!(app.flushed_messages, 2);
-    // Messages were inserted above the viewport; viewport shifts down by 2.
-    assert_eq!(terminal.get_frame().area().y, 6);
+    // Each prompt is padded with one blank row above and below → 3 rows each.
+    // Messages were inserted above the viewport; viewport shifts down by 6.
+    assert_eq!(terminal.get_frame().area().y, 10);
 
     let row = |backend: &TestBackend, y: u16| -> String {
         let area = backend.buffer().area;
@@ -854,21 +857,48 @@ fn flush_messages_writes_above_inline_viewport() {
             .to_string()
     };
     let backend = terminal.backend();
-    assert_eq!(row(backend, 4), "> hello");
-    assert_eq!(row(backend, 5), "> world");
+    assert_eq!(row(backend, 5), "> hello");
+    assert_eq!(row(backend, 8), "> world");
+}
+
+#[test]
+fn flush_prompt_lines_are_padded_and_gray_highlighted() {
+    // height = 4 (cursor_y) + 3 (padded prompt rows) + 3 (viewport)
+    let mut terminal = inline_test_terminal(30, 10, 4);
+
+    let mut app = App::new().with_prompt_prefix("> ");
+    app.add_message("hello");
+    infallible(app.flush_messages(&mut terminal));
+
+    assert_eq!(terminal.get_frame().area().y, 7);
+    let buf = terminal.backend().buffer();
+
+    let bg = |y: u16| {
+        buf[(0, y)]
+            .style()
+            .bg
+            .expect("flushed prompt rows must carry a background color")
+    };
+    // Pad row above, prompt row, pad row below all share the same pale band.
+    assert_eq!(bg(4), Color::Gray);
+    assert_eq!(bg(5), Color::Gray);
+    assert_eq!(bg(6), Color::Gray);
+    let symbol = |y: u16| buf[(0, y)].symbol();
+    assert_eq!(symbol(5), ">");
 }
 
 #[test]
 fn flush_ghost_messages_omit_prompt_prefix() {
-    let mut terminal = inline_test_terminal(40, 10, 4);
+    // height = 4 (cursor_y) + 4 (inserted rows) + 3 (viewport)
+    let mut terminal = inline_test_terminal(40, 11, 4);
 
     let mut app = App::new().with_prompt_prefix("> ");
     app.add_message("! echo hi");
     app.add_ghost("hi");
     infallible(app.flush_messages(&mut terminal));
 
-    // Ghost rows must shift the inline viewport the same way prompt rows do.
-    assert_eq!(terminal.get_frame().area().y, 6);
+    // Padded prompt (3 rows) + ghost (1 row) = 4 inserted rows above the viewport.
+    assert_eq!(terminal.get_frame().area().y, 8);
 
     let row = |backend: &TestBackend, y: u16| -> String {
         let area = backend.buffer().area;
@@ -879,8 +909,8 @@ fn flush_ghost_messages_omit_prompt_prefix() {
             .to_string()
     };
     let backend = terminal.backend();
-    assert_eq!(row(backend, 4), "> ! echo hi");
-    assert_eq!(row(backend, 5), "hi");
+    assert_eq!(row(backend, 5), "> ! echo hi");
+    assert_eq!(row(backend, 7), "hi");
 }
 
 #[test]
@@ -897,9 +927,10 @@ fn teardown_after_pending_ghost_flush_parks_cursor_below_output() {
     infallible(App::teardown_inline(&mut terminal));
 
     assert_eq!(app.flushed_messages, 3);
+    // Padded prompt (3 rows) + 2 ghosts = 5 inserted rows below cursor_y (4).
     assert_eq!(
         infallible(terminal.get_cursor_position()),
-        Position::new(0, 7),
+        Position::new(0, 9),
         "cursor must sit just below flushed ghost lines"
     );
 
@@ -912,9 +943,9 @@ fn teardown_after_pending_ghost_flush_parks_cursor_below_output() {
             .to_string()
     };
     let backend = terminal.backend();
-    assert_eq!(row(backend, 4), "> ! echo hi");
-    assert_eq!(row(backend, 5), "hi");
-    assert_eq!(row(backend, 6), "bye");
+    assert_eq!(row(backend, 5), "> ! echo hi");
+    assert_eq!(row(backend, 7), "hi");
+    assert_eq!(row(backend, 8), "bye");
 }
 
 #[test]
@@ -1328,7 +1359,7 @@ fn flush_japanese_prompt_renders_without_spurious_gaps() {
     infallible(app.flush_messages(&mut terminal));
 
     let backend = terminal.backend();
-    let line = visible_row(backend, 4);
+    let line = visible_row(backend, 5);
     assert!(
         !line.contains("こ ん"),
         "CJK must not have spaces between chars: {line:?}"
