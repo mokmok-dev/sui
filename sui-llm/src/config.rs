@@ -1,19 +1,47 @@
+use std::path::{Path, PathBuf};
+
+use reqwest::Url;
+use serde::Deserialize;
+
 use crate::LlmError;
 
-/// Connection settings for a `LiteLLM` Proxy (`OpenAI`-compatible).
+/// OpenAI-compatible API used by [`crate::LlmClient`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum ApiMode {
+    /// The `/chat/completions` endpoint.
+    #[default]
+    ChatCompletions,
+    /// The `/responses` endpoint.
+    Responses,
+}
+
+impl ApiMode {
+    fn parse(value: &str) -> Result<Self, LlmError> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "chat_completions" | "chat-completions" | "chat" => Ok(Self::ChatCompletions),
+            "responses" | "response" => Ok(Self::Responses),
+            _ => Err(LlmError::InvalidConfig(
+                "api_mode must be `chat_completions` or `responses`".into(),
+            )),
+        }
+    }
+}
+
+/// Connection settings for an OpenAI-compatible API.
 ///
-/// `base_url` is treated as **trusted operator configuration**. It is not an
-/// end-user input surface: feed only known Proxy endpoints. Validation allows
-/// `http`/`https`, requires a host, and rejects userinfo; it does not attempt
-/// IP blocklists. Cleartext `http` remains allowed for local proxies.
+/// `base_url` is trusted operator configuration. Validation allows `http` and
+/// `https`, requires a host, rejects userinfo, and normalizes the path to end
+/// in `/v1`. Cleartext `http` remains useful for local endpoints.
 ///
-/// The API key is stored as a plain [`String`] (not `SecretString`); [`Debug`]
-/// redacts non-empty values. Prefer not to log configs at all in production.
+/// The API key is stored as a plain [`String`]; [`Debug`](std::fmt::Debug)
+/// redacts non-empty values. Prefer not to log configs in production.
 #[derive(Clone, PartialEq, Eq)]
 pub struct LlmConfig {
     base_url: String,
     api_key: String,
     model: String,
+    api_mode: ApiMode,
 }
 
 impl std::fmt::Debug for LlmConfig {
@@ -25,26 +53,40 @@ impl std::fmt::Debug for LlmConfig {
             .field("base_url", &self.base_url)
             .field("api_key", &redact_secret(&self.api_key))
             .field("model", &self.model)
+            .field("api_mode", &self.api_mode)
             .finish()
     }
 }
 
 impl LlmConfig {
-    /// Creates config from explicit values.
+    /// Creates chat-completions config from explicit values.
     ///
-    /// `base_url` may omit the `/v1` suffix; it is normalized for
-    /// `async-openai` (which appends `/chat/completions`).
+    /// `base_url` may omit the `/v1` suffix. Use [`Self::new_with_mode`] or
+    /// [`Self::with_api_mode`] to select the Responses API.
     ///
     /// # Errors
     ///
-    /// Returns [`LlmError::InvalidConfig`] when `base_url` or `model` is empty
-    /// after trimming, `base_url` is not an `http`/`https` URL with a host and
-    /// without userinfo, `base_url` contains ASCII controls, or `api_key` is not
-    /// a header-safe token (avoids panics inside `async-openai`).
+    /// Returns [`LlmError::InvalidConfig`] for invalid URL, API key, or model
+    /// values.
     pub fn new(
         base_url: impl AsRef<str>,
         api_key: impl Into<String>,
         model: impl AsRef<str>,
+    ) -> Result<Self, LlmError> {
+        Self::new_with_mode(base_url, api_key, model, ApiMode::ChatCompletions)
+    }
+
+    /// Creates config with an explicit API mode.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LlmError::InvalidConfig`] for invalid URL, API key, or model
+    /// values.
+    pub fn new_with_mode(
+        base_url: impl AsRef<str>,
+        api_key: impl Into<String>,
+        model: impl AsRef<str>,
+        api_mode: ApiMode,
     ) -> Result<Self, LlmError> {
         let base_url = normalize_base_url(base_url.as_ref())?;
         let api_key = api_key.into();
@@ -54,11 +96,25 @@ impl LlmConfig {
             base_url,
             api_key,
             model: model.to_owned(),
+            api_mode,
         })
     }
 
-    /// Loads `LITELLM_BASE_URL`, optional `LITELLM_API_KEY`, and
-    /// `LITELLM_MODEL` from the process environment.
+    /// Returns this config with a different API mode.
+    #[must_use]
+    pub const fn with_api_mode(
+        mut self,
+        api_mode: ApiMode,
+    ) -> Self {
+        self.api_mode = api_mode;
+        self
+    }
+
+    /// Loads `SUI_LLM_BASE_URL`, optional `SUI_LLM_API_KEY`,
+    /// `SUI_LLM_MODEL`, and optional `SUI_LLM_API_MODE`.
+    ///
+    /// The old `LITELLM_*` names are accepted as fallbacks for migration.
+    /// Canonical `SUI_LLM_*` values always win when both names are set.
     ///
     /// # Errors
     ///
@@ -68,61 +124,267 @@ impl LlmConfig {
         Self::from_lookup(|key| std::env::var(key))
     }
 
-    /// Normalized `OpenAI`-compatible API base (includes `/v1`).
+    /// Loads the `[llm]` section from the default `config.toml`.
+    ///
+    /// The path is resolved by [`default_config_path`]. A document containing
+    /// only other sections, such as `[theme]`, is treated as missing so callers
+    /// can fall back to environment configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LlmError::MissingConfig`] when no file or `[llm]` section is
+    /// present, [`LlmError::ConfigFile`] for other read failures, or
+    /// [`LlmError::InvalidConfig`] for malformed values.
+    pub fn from_config() -> Result<Self, LlmError> {
+        let Some(path) = default_config_path() else {
+            return Err(LlmError::MissingConfig);
+        };
+        Self::from_config_path(path)
+    }
+
+    /// Loads the `[llm]` section from an explicit TOML path.
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::from_config`].
+    pub fn from_config_path(path: impl AsRef<Path>) -> Result<Self, LlmError> {
+        let raw = match std::fs::read_to_string(path.as_ref()) {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(LlmError::MissingConfig);
+            },
+            Err(error) => return Err(LlmError::ConfigFile(error)),
+        };
+        Self::from_toml(&raw)
+    }
+
+    /// Parses a TOML document containing an `[llm]` section.
+    ///
+    /// Expected shape:
+    ///
+    /// ```toml
+    /// [llm]
+    /// base_url = "https://api.openai.com/v1"
+    /// api_key = "sk-..."
+    /// model = "gpt-4o"
+    /// api_mode = "chat_completions"
+    /// ```
+    ///
+    /// This parser requires the file's `base_url` and `model` fields. The
+    /// environment-aware [`Self::from_config_or_env`] fills missing fields
+    /// from canonical `SUI_LLM_*` variables, then the legacy `LITELLM_*`
+    /// aliases.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LlmError::MissingConfig`] without an `[llm]` section, or
+    /// [`LlmError::InvalidConfig`] for malformed TOML or values.
+    pub fn from_toml(input: &str) -> Result<Self, LlmError> {
+        let document = toml::from_str::<FileConfig>(input)
+            .map_err(|_| LlmError::InvalidConfig("invalid config.toml".into()))?;
+        let Some(llm) = document.llm else {
+            return Err(LlmError::MissingConfig);
+        };
+        let base_url = llm
+            .base_url
+            .ok_or_else(|| LlmError::InvalidConfig("[llm] requires `base_url`".into()))?;
+        let model = llm
+            .model
+            .ok_or_else(|| LlmError::InvalidConfig("[llm] requires `model`".into()))?;
+        let api_mode = llm
+            .api_mode
+            .as_deref()
+            .map(ApiMode::parse)
+            .transpose()?
+            .unwrap_or_default();
+        Self::new_with_mode(base_url, llm.api_key.unwrap_or_default(), model, api_mode)
+    }
+
+    /// Loads the default TOML config, falling back to environment settings
+    /// when the file or its `[llm]` section is absent.
+    ///
+    /// # Errors
+    ///
+    /// Propagates configuration-file, environment, and validation errors.
+    pub fn from_config_or_env() -> Result<Self, LlmError> {
+        Self::from_config_or_env_at(default_config_path(), |key| std::env::var(key))
+    }
+
+    /// Normalized OpenAI-compatible API base (includes `/v1`).
     #[must_use]
     pub fn base_url(&self) -> &str {
         &self.base_url
     }
 
-    /// Proxy credential (virtual key). May be empty for open local proxies.
+    /// API credential. It may be empty for an open local endpoint.
     #[must_use]
     pub fn api_key(&self) -> &str {
         &self.api_key
     }
 
-    /// Default logical model name for chat calls.
+    /// Default model name for chat calls.
     #[must_use]
     pub fn model(&self) -> &str {
         &self.model
+    }
+
+    /// API mode used by this config.
+    #[must_use]
+    pub const fn api_mode(&self) -> ApiMode {
+        self.api_mode
     }
 
     fn from_lookup<F>(mut lookup: F) -> Result<Self, LlmError>
     where
         F: FnMut(&str) -> Result<String, std::env::VarError>,
     {
-        let base_url = require_env_lookup(&mut lookup, "LITELLM_BASE_URL")?;
-        let api_key = match lookup("LITELLM_API_KEY") {
-            Ok(value) => value,
-            Err(std::env::VarError::NotPresent) => String::new(),
-            Err(std::env::VarError::NotUnicode(_)) => {
-                return Err(LlmError::InvalidConfig(
-                    "LITELLM_API_KEY must be valid UTF-8".into(),
-                ));
+        let base_url = lookup_env(&mut lookup, "SUI_LLM_BASE_URL", "LITELLM_BASE_URL")?
+            .ok_or(LlmError::MissingEnv("SUI_LLM_BASE_URL"))?;
+        let api_key =
+            lookup_env(&mut lookup, "SUI_LLM_API_KEY", "LITELLM_API_KEY")?.unwrap_or_default();
+        let model = lookup_env(&mut lookup, "SUI_LLM_MODEL", "LITELLM_MODEL")?
+            .ok_or(LlmError::MissingEnv("SUI_LLM_MODEL"))?;
+        let api_mode = lookup_env(&mut lookup, "SUI_LLM_API_MODE", "LITELLM_API_MODE")?
+            .map(|value| ApiMode::parse(&value))
+            .transpose()?
+            .unwrap_or_default();
+        Self::new_with_mode(base_url, api_key, model, api_mode)
+    }
+
+    fn from_config_path_and_lookup<F>(
+        path: impl AsRef<Path>,
+        mut lookup: F,
+    ) -> Result<Self, LlmError>
+    where
+        F: FnMut(&str) -> Result<String, std::env::VarError>,
+    {
+        let raw = match std::fs::read_to_string(path.as_ref()) {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(LlmError::MissingConfig);
+            },
+            Err(error) => return Err(LlmError::ConfigFile(error)),
+        };
+        let document = toml::from_str::<FileConfig>(&raw)
+            .map_err(|_| LlmError::InvalidConfig("invalid config.toml".into()))?;
+        let Some(llm) = document.llm else {
+            return Err(LlmError::MissingConfig);
+        };
+        Self::from_file_and_lookup(llm, |key| lookup(key))
+    }
+
+    fn from_config_or_env_at<F>(
+        path: Option<PathBuf>,
+        mut lookup: F,
+    ) -> Result<Self, LlmError>
+    where
+        F: FnMut(&str) -> Result<String, std::env::VarError>,
+    {
+        match path {
+            Some(path) => match Self::from_config_path_and_lookup(&path, &mut lookup) {
+                Ok(config) => Ok(config),
+                Err(LlmError::MissingConfig) => Self::from_lookup(lookup),
+                Err(error) => Err(error),
+            },
+            None => Self::from_lookup(lookup),
+        }
+    }
+
+    fn from_file_and_lookup<F>(
+        llm: FileLlmConfig,
+        mut lookup: F,
+    ) -> Result<Self, LlmError>
+    where
+        F: FnMut(&str) -> Result<String, std::env::VarError>,
+    {
+        let base_url = match llm.base_url {
+            Some(value) => value,
+            None => lookup_env(&mut lookup, "SUI_LLM_BASE_URL", "LITELLM_BASE_URL")?
+                .ok_or(LlmError::MissingEnv("SUI_LLM_BASE_URL"))?,
+        };
+        let api_key = match llm.api_key {
+            Some(value) => value,
+            None => {
+                lookup_env(&mut lookup, "SUI_LLM_API_KEY", "LITELLM_API_KEY")?.unwrap_or_default()
             },
         };
-        let model = require_env_lookup(&mut lookup, "LITELLM_MODEL")?;
-        Self::new(base_url, api_key, model)
+        let model = match llm.model {
+            Some(value) => value,
+            None => lookup_env(&mut lookup, "SUI_LLM_MODEL", "LITELLM_MODEL")?
+                .ok_or(LlmError::MissingEnv("SUI_LLM_MODEL"))?,
+        };
+        let api_mode = match llm.api_mode {
+            Some(value) => ApiMode::parse(&value)?,
+            None => lookup_env(&mut lookup, "SUI_LLM_API_MODE", "LITELLM_API_MODE")?
+                .map(|value| ApiMode::parse(&value))
+                .transpose()?
+                .unwrap_or_default(),
+        };
+        Self::new_with_mode(base_url, api_key, model, api_mode)
     }
 }
 
-fn require_env_lookup<F>(
+#[derive(Deserialize)]
+struct FileConfig {
+    llm: Option<FileLlmConfig>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileLlmConfig {
+    base_url: Option<String>,
+    api_key: Option<String>,
+    model: Option<String>,
+    api_mode: Option<String>,
+}
+
+fn lookup_env<F>(
     lookup: &mut F,
-    key: &'static str,
-) -> Result<String, LlmError>
+    canonical: &'static str,
+    legacy: &'static str,
+) -> Result<Option<String>, LlmError>
 where
     F: FnMut(&str) -> Result<String, std::env::VarError>,
 {
-    match lookup(key) {
-        Ok(value) => Ok(value),
-        Err(std::env::VarError::NotPresent) => Err(LlmError::MissingEnv(key)),
+    match lookup(canonical) {
+        Ok(value) => Ok(Some(value)),
         Err(std::env::VarError::NotUnicode(_)) => Err(LlmError::InvalidConfig(format!(
-            "{key} must be valid UTF-8"
+            "{canonical} must be valid UTF-8"
         ))),
+        Err(std::env::VarError::NotPresent) => match lookup(legacy) {
+            Ok(value) => Ok(Some(value)),
+            Err(std::env::VarError::NotPresent) => Ok(None),
+            Err(std::env::VarError::NotUnicode(_)) => Err(LlmError::InvalidConfig(format!(
+                "{legacy} must be valid UTF-8"
+            ))),
+        },
     }
 }
 
+/// Resolves the default `config.toml` path using the repository convention.
+///
+/// `$SUI_CONFIG` takes precedence, followed by
+/// `$XDG_CONFIG_HOME/sui/config.toml`, then `~/.config/sui/config.toml`.
+#[must_use]
+pub fn default_config_path() -> Option<PathBuf> {
+    default_config_path_from(|key| std::env::var_os(key))
+}
+
+fn default_config_path_from<F>(mut lookup: F) -> Option<PathBuf>
+where
+    F: FnMut(&str) -> Option<std::ffi::OsString>,
+{
+    if let Some(path) = lookup("SUI_CONFIG").filter(|path| !path.is_empty()) {
+        return Some(PathBuf::from(path));
+    }
+    let base = lookup("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| lookup("HOME").map(|home| PathBuf::from(home).join(".config")))?;
+    Some(base.join("sui").join("config.toml"))
+}
+
 /// Trims and rejects an empty logical model name.
-pub fn require_non_empty_model(model: &str) -> Result<&str, LlmError> {
+fn require_non_empty_model(model: &str) -> Result<&str, LlmError> {
     let trimmed = model.trim();
     if trimmed.is_empty() {
         return Err(LlmError::InvalidConfig(
@@ -133,12 +395,7 @@ pub fn require_non_empty_model(model: &str) -> Result<&str, LlmError> {
 }
 
 fn validate_api_key(api_key: &str) -> Result<(), LlmError> {
-    // `async-openai` builds `Authorization: Bearer {api_key}` via
-    // `HeaderValue::parse(...).unwrap()`. Reject anything that would panic.
-    if !api_key
-        .bytes()
-        .all(|b| (0x20..=0x7e).contains(&b) && b != b' ')
-    {
+    if !api_key.bytes().all(|byte| (0x21..=0x7e).contains(&byte)) {
         return Err(LlmError::InvalidConfig(
             "api_key must be printable ASCII without spaces or controls".into(),
         ));
@@ -158,47 +415,56 @@ fn normalize_base_url(raw: &str) -> Result<String, LlmError> {
             "base_url must not contain control characters".into(),
         ));
     }
-    let without_slash = trimmed.trim_end_matches('/');
-    let has_v1_suffix = without_slash
-        .get(without_slash.len().saturating_sub(3)..)
-        .is_some_and(|suffix| suffix.eq_ignore_ascii_case("/v1"));
-    let normalized = if has_v1_suffix {
-        without_slash.to_owned()
-    } else {
-        format!("{without_slash}/v1")
-    };
-    validate_base_url(&normalized)?;
-    Ok(normalized)
-}
-
-fn validate_base_url(url: &str) -> Result<(), LlmError> {
-    if url.chars().any(|c| c.is_control() || c.is_whitespace()) {
+    if trimmed.chars().any(char::is_whitespace) {
         return Err(LlmError::InvalidConfig(
-            "base_url must not contain whitespace or control characters".into(),
+            "base_url must not contain whitespace".into(),
         ));
     }
-    let Some((scheme, rest)) = url.split_once("://") else {
+    let Some((_, authority_and_path)) = trimmed.split_once("://") else {
         return Err(LlmError::InvalidConfig(
-            "base_url must use http or https scheme".into(),
+            "base_url must be a valid http or https URL".into(),
         ));
     };
-    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
-        return Err(LlmError::InvalidConfig(
-            "base_url must use http or https scheme".into(),
-        ));
-    }
-    let authority = rest.split('/').next().unwrap_or("");
-    if authority.is_empty() {
+    if authority_and_path.is_empty() || authority_and_path.starts_with(['/', '?', '#']) {
         return Err(LlmError::InvalidConfig(
             "base_url must include a host".into(),
         ));
     }
-    if authority.contains('@') {
+    let url = Url::parse(trimmed).map_err(|_| {
+        LlmError::InvalidConfig("base_url must be a valid http or https URL".into())
+    })?;
+    if url.scheme() != "http" && url.scheme() != "https" {
+        return Err(LlmError::InvalidConfig(
+            "base_url must use http or https scheme".into(),
+        ));
+    }
+    if url.host_str().is_none_or(str::is_empty) {
+        return Err(LlmError::InvalidConfig(
+            "base_url must include a host".into(),
+        ));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
         return Err(LlmError::InvalidConfig(
             "base_url must not include userinfo".into(),
         ));
     }
-    Ok(())
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err(LlmError::InvalidConfig(
+            "base_url must not include a query or fragment".into(),
+        ));
+    }
+    let has_v1_suffix = url
+        .path()
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .is_some_and(|suffix| suffix.eq_ignore_ascii_case("v1"));
+    let without_slash = trimmed.trim_end_matches('/');
+    if has_v1_suffix {
+        Ok(without_slash.to_owned())
+    } else {
+        Ok(format!("{without_slash}/v1"))
+    }
 }
 
 fn redact_secret(secret: &str) -> String {
@@ -212,81 +478,161 @@ fn redact_secret(secret: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
 
     #[test]
-    fn normalizes_base_url_and_rejects_empty() {
+    fn normalizes_base_url_and_mode() {
         let cfg = LlmConfig::new("http://localhost:4000/", "k", "m").expect("config");
         assert_eq!(cfg.base_url(), "http://localhost:4000/v1");
         assert_eq!(cfg.api_key(), "k");
         assert_eq!(cfg.model(), "m");
+        assert_eq!(cfg.api_mode(), ApiMode::ChatCompletions);
 
-        let already = LlmConfig::new("http://localhost:4000/v1", "", "gpt").expect("config");
-        assert_eq!(already.base_url(), "http://localhost:4000/v1");
+        let responses = LlmConfig::new_with_mode(
+            "https://api.example.test/openai",
+            "",
+            "gpt",
+            ApiMode::Responses,
+        )
+        .expect("responses config");
+        assert_eq!(responses.base_url(), "https://api.example.test/openai/v1");
+        assert_eq!(responses.api_mode(), ApiMode::Responses);
 
+        let encoded = LlmConfig::new("http://localhost/api%20v1", "k", "m").expect("config");
+        assert_eq!(encoded.base_url(), "http://localhost/api%20v1/v1");
+    }
+
+    #[test]
+    fn rejects_unsafe_values() {
+        for url in [
+            "ftp://localhost:4000",
+            "http://user:pass@localhost:4000",
+            "http://localhost:4000?secret=bad",
+            "http:///v1",
+            "  ",
+        ] {
+            assert!(
+                matches!(
+                    LlmConfig::new(url, "k", "m"),
+                    Err(LlmError::InvalidConfig(_))
+                ),
+                "accepted unsafe URL {url:?}"
+            );
+        }
+        for key in ["bad key", "bad\nkey", "bad\rkey", "bad\x01key"] {
+            assert!(matches!(
+                LlmConfig::new("http://localhost:4000", key, "m"),
+                Err(LlmError::InvalidConfig(_))
+            ));
+        }
         assert!(matches!(
-            LlmConfig::new("  ", "k", "m"),
-            Err(LlmError::InvalidConfig(_))
-        ));
-        assert!(matches!(
-            LlmConfig::new("http://x", "k", "  "),
+            LlmConfig::new("http://localhost:4000", "k", "  "),
             Err(LlmError::InvalidConfig(_))
         ));
     }
 
     #[test]
-    fn rejects_unsafe_base_url_and_api_key() {
-        assert!(matches!(
-            LlmConfig::new("ftp://localhost:4000", "k", "m"),
-            Err(LlmError::InvalidConfig(_))
-        ));
-        assert!(matches!(
-            LlmConfig::new("http://user:pass@localhost:4000", "k", "m"),
-            Err(LlmError::InvalidConfig(_))
-        ));
-        assert!(matches!(
-            LlmConfig::new("http://localhost:4000", "bad\nkey", "m"),
-            Err(LlmError::InvalidConfig(_))
-        ));
-        assert!(matches!(
-            LlmConfig::new("http://localhost:4000", "bad\rkey", "m"),
-            Err(LlmError::InvalidConfig(_))
-        ));
-        assert!(matches!(
-            LlmConfig::new("http://localhost:4000", "bad\x01key", "m"),
-            Err(LlmError::InvalidConfig(_))
-        ));
-        assert!(matches!(
-            LlmConfig::new("http://localhost:4000\r\n/evil", "k", "m"),
-            Err(LlmError::InvalidConfig(_))
-        ));
-        assert!(matches!(
-            LlmConfig::new("http:///v1", "k", "m"),
-            Err(LlmError::InvalidConfig(_))
-        ));
-        assert!(LlmConfig::new("HTTPS://localhost:4000", "k", "m").is_ok());
+    fn parses_llm_config_from_toml() {
+        let config = LlmConfig::from_toml(
+            r#"
+            [theme]
+            active = "dark"
+
+            [llm]
+            base_url = "https://api.example.test/v1"
+            api_key = "super-secret"
+            model = "gpt-5"
+            api_mode = "responses"
+            "#,
+        )
+        .expect("config");
+        assert_eq!(config.base_url(), "https://api.example.test/v1");
+        assert_eq!(config.api_key(), "super-secret");
+        assert_eq!(config.model(), "gpt-5");
+        assert_eq!(config.api_mode(), ApiMode::Responses);
     }
 
     #[test]
-    fn from_env_rejects_non_unicode_api_key() {
-        let err = LlmConfig::from_lookup(|key| match key {
-            "LITELLM_BASE_URL" => Ok("http://localhost:4000".into()),
-            "LITELLM_MODEL" => Ok("proxy-model".into()),
-            "LITELLM_API_KEY" => Err(std::env::VarError::NotUnicode("x".into())),
+    fn config_without_llm_can_fall_back_to_environment() {
+        assert!(matches!(
+            LlmConfig::from_toml("[theme]\nactive = \"default\"\n"),
+            Err(LlmError::MissingConfig)
+        ));
+        assert!(matches!(
+            LlmConfig::from_toml("[llm]\nbase_url = \"http://localhost\"\n"),
+            Err(LlmError::InvalidConfig(_))
+        ));
+        assert!(matches!(
+            LlmConfig::from_toml("not valid [toml"),
+            Err(LlmError::InvalidConfig(_))
+        ));
+        assert!(matches!(
+            ApiMode::parse("unknown"),
+            Err(LlmError::InvalidConfig(_))
+        ));
+    }
+
+    #[test]
+    fn loads_config_from_explicit_path() {
+        let path =
+            std::env::temp_dir().join(format!("sui-llm-config-{}-test.toml", std::process::id()));
+        std::fs::write(
+            &path,
+            "[llm]\nbase_url = \"http://localhost:4000\"\nmodel = \"local\"\n",
+        )
+        .expect("write config");
+        let config = LlmConfig::from_config_path(&path).expect("config");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(config.base_url(), "http://localhost:4000/v1");
+        assert_eq!(config.model(), "local");
+    }
+
+    #[test]
+    fn missing_config_path_is_distinguishable_from_read_failure() {
+        let path =
+            std::env::temp_dir().join(format!("sui-llm-missing-{}-test.toml", std::process::id()));
+        assert!(matches!(
+            LlmConfig::from_config_path(path),
+            Err(LlmError::MissingConfig)
+        ));
+    }
+
+    #[test]
+    fn environment_config_uses_generic_names() {
+        let config = LlmConfig::from_lookup(|key| match key {
+            "SUI_LLM_BASE_URL" => Ok("http://localhost:4000".into()),
+            "SUI_LLM_MODEL" => Ok("model".into()),
+            "SUI_LLM_API_MODE" => Ok("responses".into()),
             _ => Err(std::env::VarError::NotPresent),
         })
-        .expect_err("non-utf8 api key");
-        assert!(matches!(err, LlmError::InvalidConfig(_)));
+        .expect("config");
+        assert_eq!(config.api_key(), "");
+        assert_eq!(config.api_mode(), ApiMode::Responses);
     }
 
     #[test]
-    fn from_env_rejects_blank_required_values() {
-        let err = LlmConfig::from_lookup(|key| match key {
-            "LITELLM_BASE_URL" => Ok("  ".into()),
-            "LITELLM_MODEL" => Ok("proxy-model".into()),
-            _ => Err(std::env::VarError::NotPresent),
-        })
-        .expect_err("blank base");
-        assert!(matches!(err, LlmError::InvalidConfig(_)));
+    fn default_path_honors_overrides_in_order() {
+        let explicit = default_config_path_from(|key| match key {
+            "SUI_CONFIG" => Some(OsString::from("/tmp/custom.toml")),
+            _ => None,
+        });
+        assert_eq!(explicit, Some(PathBuf::from("/tmp/custom.toml")));
+
+        let xdg = default_config_path_from(|key| match key {
+            "XDG_CONFIG_HOME" => Some(OsString::from("/tmp/xdg")),
+            "HOME" => Some(OsString::from("/tmp/home")),
+            _ => None,
+        });
+        assert_eq!(xdg, Some(PathBuf::from("/tmp/xdg/sui/config.toml")));
+
+        let home = default_config_path_from(|key| match key {
+            "HOME" => Some(OsString::from("/tmp/home")),
+            _ => None,
+        });
+        assert_eq!(
+            home,
+            Some(PathBuf::from("/tmp/home/.config/sui/config.toml"))
+        );
     }
 
     #[test]
@@ -298,37 +644,149 @@ mod tests {
     }
 
     #[test]
-    fn debug_empty_api_key_is_empty_string() {
-        let cfg = LlmConfig::new("http://localhost:4000", "", "m").expect("config");
-        let rendered = format!("{cfg:?}");
-        assert!(rendered.contains("api_key: \"\""), "{rendered}");
-        assert!(!rendered.contains("***"), "{rendered}");
+    fn config_file_debug_redacts_underlying_io_error() {
+        let path = std::env::temp_dir().join(format!("sui-llm-redact-{}-dir", std::process::id()));
+        std::fs::create_dir(&path).expect("create directory");
+        let error = LlmConfig::from_config_path(&path).expect_err("unreadable path");
+        let rendered = format!("{error:?}");
+        assert!(rendered.contains("ConfigFile"), "{rendered}");
+        assert!(!rendered.contains("temp_dir"), "{rendered}");
+        assert_eq!(error.to_string(), "could not read LLM configuration file");
+        let _ = std::fs::remove_dir(&path);
     }
 
     #[test]
-    fn from_env_missing_required_vars() {
-        let err =
-            LlmConfig::from_lookup(|_| Err(std::env::VarError::NotPresent)).expect_err("missing");
-        assert!(matches!(err, LlmError::MissingEnv("LITELLM_BASE_URL")));
-
-        let err = LlmConfig::from_lookup(|key| match key {
-            "LITELLM_BASE_URL" => Ok("http://localhost:4000".into()),
-            _ => Err(std::env::VarError::NotPresent),
-        })
-        .expect_err("missing model");
-        assert!(matches!(err, LlmError::MissingEnv("LITELLM_MODEL")));
+    fn unknown_llm_key_is_rejected() {
+        let error = LlmConfig::from_toml(
+            "[llm]\nbase_url = \"http://localhost\"\nmodel = \"m\"\napi_mod = \"responses\"\n",
+        )
+        .expect_err("typo must be rejected");
+        assert!(matches!(error, LlmError::InvalidConfig(_)));
     }
 
     #[test]
-    fn from_env_optional_api_key_defaults_empty() {
-        let cfg = LlmConfig::from_lookup(|key| match key {
-            "LITELLM_BASE_URL" => Ok("http://localhost:4000".into()),
-            "LITELLM_MODEL" => Ok("proxy-model".into()),
+    fn file_values_win_but_missing_fields_fall_back_to_env() {
+        let path = std::env::temp_dir().join(format!(
+            "sui-llm-precedence-{}-test.toml",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            "[llm]\nbase_url = \"http://file.example\"\nmodel = \"file-model\"\n",
+        )
+        .expect("write config");
+        let config = LlmConfig::from_config_path_and_lookup(&path, |key| match key {
+            "SUI_LLM_API_KEY" => Ok("env-key".into()),
+            "SUI_LLM_API_MODE" => Ok("responses".into()),
             _ => Err(std::env::VarError::NotPresent),
         })
         .expect("config");
-        assert_eq!(cfg.api_key(), "");
-        assert_eq!(cfg.model(), "proxy-model");
-        assert_eq!(cfg.base_url(), "http://localhost:4000/v1");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(config.base_url(), "http://file.example/v1");
+        assert_eq!(config.model(), "file-model");
+        assert_eq!(config.api_key(), "env-key");
+        assert_eq!(config.api_mode(), ApiMode::Responses);
+    }
+
+    #[test]
+    fn config_or_env_falls_back_when_file_or_section_missing() {
+        let missing =
+            std::env::temp_dir().join(format!("sui-llm-or-env-{}-none.toml", std::process::id()));
+        let config = LlmConfig::from_config_or_env_at(Some(missing), |key| match key {
+            "SUI_LLM_BASE_URL" => Ok("http://env.example".into()),
+            "SUI_LLM_MODEL" => Ok("env-model".into()),
+            _ => Err(std::env::VarError::NotPresent),
+        })
+        .expect("fallback to env");
+        assert_eq!(config.base_url(), "http://env.example/v1");
+        assert_eq!(config.model(), "env-model");
+
+        let with_section = std::env::temp_dir().join(format!(
+            "sui-llm-or-env-{}-section.toml",
+            std::process::id()
+        ));
+        std::fs::write(&with_section, "[theme]\nactive = \"dark\"\n").expect("write config");
+        let config =
+            LlmConfig::from_config_or_env_at(Some(with_section.clone()), |key| match key {
+                "SUI_LLM_BASE_URL" => Ok("http://env.example".into()),
+                "SUI_LLM_MODEL" => Ok("env-model".into()),
+                _ => Err(std::env::VarError::NotPresent),
+            })
+            .expect("fallback to env");
+        let _ = std::fs::remove_file(&with_section);
+        assert_eq!(config.model(), "env-model");
+    }
+
+    #[test]
+    fn config_or_env_does_not_fall_back_on_malformed_file() {
+        let path =
+            std::env::temp_dir().join(format!("sui-llm-or-env-{}-bad.toml", std::process::id()));
+        std::fs::write(&path, "not [valid toml").expect("write config");
+        let error = LlmConfig::from_config_or_env_at(Some(path.clone()), |_| {
+            Ok("http://env.example".into())
+        })
+        .expect_err("malformed file must not fall back");
+        let _ = std::fs::remove_file(&path);
+        assert!(matches!(error, LlmError::InvalidConfig(_)));
+    }
+
+    #[test]
+    fn config_or_env_does_not_fall_back_on_unreadable_path() {
+        let path = std::env::temp_dir().join(format!("sui-llm-or-env-{}-dir", std::process::id()));
+        std::fs::create_dir(&path).expect("create directory");
+        let error = LlmConfig::from_config_or_env_at(Some(path.clone()), |_| {
+            Ok("http://env.example".into())
+        })
+        .expect_err("unreadable path must not fall back");
+        let _ = std::fs::remove_dir(&path);
+        assert!(matches!(error, LlmError::ConfigFile(_)));
+    }
+
+    #[test]
+    fn from_lookup_prefers_canonical_over_legacy() {
+        let config = LlmConfig::from_lookup(|key| match key {
+            "SUI_LLM_BASE_URL" => Ok("http://canonical.example".into()),
+            "LITELLM_BASE_URL" => Ok("http://legacy.example".into()),
+            "SUI_LLM_MODEL" => Ok("canonical-model".into()),
+            "LITELLM_MODEL" => Ok("legacy-model".into()),
+            "SUI_LLM_API_KEY" => Ok("env-key".into()),
+            _ => Err(std::env::VarError::NotPresent),
+        })
+        .expect("config");
+        assert_eq!(config.base_url(), "http://canonical.example/v1");
+        assert_eq!(config.model(), "canonical-model");
+
+        let legacy = LlmConfig::from_lookup(|key| match key {
+            "LITELLM_BASE_URL" => Ok("http://legacy.example".into()),
+            "LITELLM_MODEL" => Ok("legacy-model".into()),
+            _ => Err(std::env::VarError::NotPresent),
+        })
+        .expect("legacy fallback");
+        assert_eq!(legacy.base_url(), "http://legacy.example/v1");
+        assert_eq!(legacy.model(), "legacy-model");
+    }
+
+    #[test]
+    fn from_lookup_errors_on_missing_required_and_bad_values() {
+        assert!(matches!(
+            LlmConfig::from_lookup(|_| Err(std::env::VarError::NotPresent)),
+            Err(LlmError::MissingEnv(_))
+        ));
+        assert!(matches!(
+            LlmConfig::from_lookup(|key| match key {
+                "SUI_LLM_BASE_URL" => Ok("http://localhost".into()),
+                "SUI_LLM_MODEL" => Ok("m".into()),
+                "SUI_LLM_API_MODE" => Ok("bogus".into()),
+                _ => Err(std::env::VarError::NotPresent),
+            }),
+            Err(LlmError::InvalidConfig(_))
+        ));
+        assert!(matches!(
+            LlmConfig::from_lookup(|key| match key {
+                "SUI_LLM_BASE_URL" => Err(std::env::VarError::NotUnicode("bad".into())),
+                _ => Err(std::env::VarError::NotPresent),
+            }),
+            Err(LlmError::InvalidConfig(_))
+        ));
     }
 }

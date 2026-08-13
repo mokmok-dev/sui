@@ -87,6 +87,7 @@ pub struct ChatMessage {
     pub tool_calls: Vec<ToolCall>,
     /// Id of the tool call this result answers ([`Role::Tool`] only).
     pub tool_call_id: Option<String>,
+    pub(crate) responses_output: Option<Vec<serde_json::Value>>,
 }
 
 impl ChatMessage {
@@ -98,6 +99,7 @@ impl ChatMessage {
             content: content.into(),
             tool_calls: Vec::new(),
             tool_call_id: None,
+            responses_output: None,
         }
     }
 
@@ -109,6 +111,7 @@ impl ChatMessage {
             content: content.into(),
             tool_calls: Vec::new(),
             tool_call_id: None,
+            responses_output: None,
         }
     }
 
@@ -120,6 +123,7 @@ impl ChatMessage {
             content: content.into(),
             tool_calls: Vec::new(),
             tool_call_id: None,
+            responses_output: None,
         }
     }
 
@@ -134,6 +138,7 @@ impl ChatMessage {
             content: content.into(),
             tool_calls,
             tool_call_id: None,
+            responses_output: None,
         }
     }
 
@@ -148,6 +153,21 @@ impl ChatMessage {
             content: content.into(),
             tool_calls: Vec::new(),
             tool_call_id: Some(tool_call_id.into()),
+            responses_output: None,
+        }
+    }
+
+    pub(crate) fn assistant_with_responses_output(
+        content: impl Into<String>,
+        tool_calls: Vec<ToolCall>,
+        responses_output: Vec<serde_json::Value>,
+    ) -> Self {
+        Self {
+            role: Role::Assistant,
+            content: content.into(),
+            tool_calls,
+            tool_call_id: None,
+            responses_output: Some(responses_output),
         }
     }
 }

@@ -1,17 +1,15 @@
-//! Thin OpenAI-compatible LLM client for a `LiteLLM` Proxy.
+//! Direct OpenAI-compatible HTTP client for Chat Completions and Responses.
 //!
-//! Provider routing, retries, and upstream keys live in the Proxy. This crate
-//! only talks `OpenAI` chat completions at a configurable `base_url` with a
-//! Proxy-issued `api_key` and a logical `model` name. Tool calling uses the
-//! same wire format: advertise [`ToolSpec`]s, read [`ChatResponse::tool_calls`],
-//! append [`ChatMessage::tool`] results, sample again.
+//! Configure an endpoint with [`LlmConfig`] and use [`LlmClient`] for text or
+//! tool-calling turns. Chat Completions is the default wire format; select the
+//! Responses API with [`ApiMode::Responses`]. Both modes support streaming.
 //!
 //! # Configuration
 //!
-//! Environment variables (see [`LlmConfig::from_env`]):
-//! - `LITELLM_BASE_URL` — Proxy `OpenAI` base (with or without `/v1`)
-//! - `LITELLM_API_KEY` — Proxy credential (virtual key); may be empty
-//! - `LITELLM_MODEL` — default logical model name
+//! The binary loads `[llm]` from `$SUI_CONFIG`,
+//! `$XDG_CONFIG_HOME/sui/config.toml`, or `~/.config/sui/config.toml`. The
+//! same values can be supplied through `SUI_LLM_BASE_URL`, optional
+//! `SUI_LLM_API_KEY`, `SUI_LLM_MODEL`, and optional `SUI_LLM_API_MODE`.
 //!
 //! `base_url` is trusted operator config (see [`LlmConfig`]). Do not pass
 //! untrusted URLs.
@@ -26,7 +24,7 @@
 //! # async fn demo() -> Result<(), sui_llm::LlmError> {
 //! use sui_llm::{ChatMessage, LlmClient, LlmConfig};
 //!
-//! let config = LlmConfig::new("http://localhost:4000", "sk-litellm-...", "gpt-4o")?;
+//! let config = LlmConfig::new("https://api.openai.com", "sk-...", "gpt-4o")?;
 //! let client = LlmClient::new(&config);
 //! let reply = client.chat(&[ChatMessage::user("hello")]).await?;
 //! println!("{}", reply.content);
@@ -41,6 +39,6 @@ mod error;
 mod message;
 
 pub use client::{ChatChunk, ChatResponse, ChatStream, LlmClient};
-pub use config::LlmConfig;
-pub use error::LlmError;
+pub use config::{ApiMode, LlmConfig, default_config_path};
+pub use error::{ApiError, LlmError};
 pub use message::{ChatMessage, Role, ToolCall, ToolSpec};
