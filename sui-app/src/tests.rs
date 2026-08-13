@@ -191,6 +191,22 @@ fn type_and_enter(
     app.settle_pending_llm();
 }
 
+fn named_models() -> Vec<sui_llm::LlmModel> {
+    sui_llm::LlmModel::from_toml(
+        r#"
+        [[model."gemma4"]]
+        base_url = "http://localhost:11434"
+        model = "gemma4:latest"
+
+        [[model."gpt4o"]]
+        base_url = "https://api.openai.com/v1"
+        api_key = "test-key"
+        model = "gpt-4o"
+        "#,
+    )
+    .expect("models")
+}
+
 /// Enter shell mode (`!` on empty prompt) then type/run a command.
 fn shell_and_enter(
     app: &mut App,
@@ -226,6 +242,70 @@ fn slash_unknown_shows_error() {
     assert!(!app.should_quit);
     assert!(app.input.is_empty());
     assert_eq!(message_texts(&app), vec!["unknown command: /foo"]);
+}
+
+#[test]
+fn slash_model_candidates_switch_active_model() {
+    let mut app = App::new().with_models(named_models());
+    assert_eq!(app.active_model, Some(0));
+
+    type_text(&mut app, "/model");
+    assert_eq!(app.slash_candidates.len(), 2);
+    app.handle_key(key(KeyCode::Down));
+    app.handle_key(key(KeyCode::Enter));
+
+    assert_eq!(app.active_model, Some(1));
+    assert_eq!(
+        app.llm.as_ref().expect("active client").default_model(),
+        "gpt-4o"
+    );
+    assert_eq!(message_texts(&app), vec!["model: gpt4o (gpt-4o)"]);
+}
+
+#[test]
+fn slash_model_unknown_name_shows_error() {
+    let mut app = App::new().with_models(named_models());
+    type_and_enter(&mut app, "/model missing");
+    assert_eq!(message_texts(&app), vec!["unknown model: missing"]);
+}
+
+#[test]
+fn slash_model_without_named_models_shows_hint() {
+    let mut app = App::new();
+    type_and_enter(&mut app, "/model");
+    assert_eq!(
+        message_texts(&app),
+        vec!["no models configured: add [[model.\"name\"]] entries to config.toml"]
+    );
+}
+
+#[test]
+fn with_llm_clears_switchable_model_state() {
+    let config = sui_llm::LlmConfig::new("http://localhost:4000", "", "single").expect("config");
+    let app = App::new()
+        .with_models(named_models())
+        .with_llm(sui_llm::LlmClient::new(&config));
+
+    assert!(app.models.is_empty());
+    assert_eq!(app.active_model, None);
+    assert_eq!(
+        app.llm.as_ref().expect("active client").default_model(),
+        "single"
+    );
+}
+
+#[test]
+fn tab_on_model_candidates_cycles_without_replacing_command() {
+    let mut app = App::new().with_models(named_models());
+    type_text(&mut app, "/model");
+    assert_eq!(app.input, "/model");
+    assert_eq!(app.slash_selected, 0);
+
+    app.handle_key(key(KeyCode::Tab));
+
+    assert_eq!(app.input, "/model");
+    assert_eq!(app.slash_selected, 1);
+    assert_eq!(app.slash_candidates.len(), 2);
 }
 
 #[test]
@@ -397,7 +477,7 @@ fn bare_slash_has_candidate_and_enter_executes_it() {
 fn slash_candidates_populated_after_typing_slash() {
     let mut app = App::new();
     app.handle_key(key_char('/'));
-    assert_eq!(app.slash_candidates.len(), 2); // exit + quit match ""
+    assert_eq!(app.slash_candidates.len(), 3); // exit + quit + model match ""
 
     app.handle_key(key_char('e'));
     assert_eq!(app.slash_candidates.len(), 1); // "exit" starts with "e"
@@ -420,18 +500,20 @@ fn slash_candidates_match_quit_prefix() {
 #[test]
 fn down_up_cycle_candidates_and_wrap() {
     let mut app = App::new();
-    // Type "/" to populate candidates (exit, quit)
+    // Type "/" to populate candidates (exit, quit, model)
     app.handle_key(key_char('/'));
     assert_eq!(app.slash_selected, 0);
     app.handle_key(key(KeyCode::Down));
     assert_eq!(app.slash_selected, 1);
     app.handle_key(key(KeyCode::Down));
+    assert_eq!(app.slash_selected, 2);
+    app.handle_key(key(KeyCode::Down));
     assert_eq!(app.slash_selected, 0);
 
     app.handle_key(key(KeyCode::Up));
-    assert_eq!(app.slash_selected, 1);
+    assert_eq!(app.slash_selected, 2);
     app.handle_key(key(KeyCode::BackTab));
-    assert_eq!(app.slash_selected, 0);
+    assert_eq!(app.slash_selected, 1);
 }
 
 #[test]
@@ -686,14 +768,16 @@ fn ctrl_k_updates_slash_candidates() {
 fn ctrl_n_p_cycle_candidates() {
     let mut app = App::new();
     app.handle_key(key_char('/'));
-    // With 2 candidates (exit, quit), cycling wraps
+    // With 3 candidates (exit, quit, model), cycling wraps
     assert_eq!(app.slash_selected, 0);
     app.handle_key(ctrl_key('n'));
     assert_eq!(app.slash_selected, 1);
+    app.handle_key(ctrl_key('n'));
+    assert_eq!(app.slash_selected, 2);
     app.handle_key(ctrl_key('n'));
     assert_eq!(app.slash_selected, 0);
     app.handle_key(ctrl_key('p'));
-    assert_eq!(app.slash_selected, 1);
+    assert_eq!(app.slash_selected, 2);
 }
 
 // ── Tab autocomplete tests ───────────────────────────────────────
@@ -751,8 +835,8 @@ fn inline_height_grows_with_wrapped_input() {
 fn inline_height_grows_with_slash_candidates() {
     let mut app = App::new();
     app.handle_key(key_char('/'));
-    // "/" matches exit + quit — panel opens at a fixed budget, not per-row.
-    assert_eq!(app.slash_candidates.len(), 2);
+    // "/" matches exit + quit + model — panel opens at a fixed budget, not per-row.
+    assert_eq!(app.slash_candidates.len(), 3);
     let open_height = app.inline_height(80);
     assert!(open_height > PROMPT_HEIGHT);
 

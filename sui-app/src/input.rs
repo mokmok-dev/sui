@@ -260,8 +260,15 @@ impl App {
                 self.accept_selected_at();
             },
             KeyCode::Tab if !self.slash_candidates.is_empty() => {
-                let name = self.selected_candidate_name();
-                self.input = format!("/{name}");
+                if matches!(
+                    self.slash_candidates[self.slash_selected],
+                    crate::slash::SlashCandidate::Model { .. }
+                ) {
+                    "/model".clone_into(&mut self.input);
+                } else {
+                    let name = self.selected_candidate_name();
+                    self.input = format!("/{name}");
+                }
                 self.cursor_position = self.input.chars().count();
                 self.slash_selected = (self.slash_selected + 1) % self.slash_candidates.len();
                 self.refresh_suggestions();

@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use reqwest::Url;
@@ -324,9 +325,209 @@ impl LlmConfig {
     }
 }
 
+/// A named model loaded from a `[[model.<name>]]` section of `config.toml`.
+///
+/// Each section supplies the same connection settings as `[llm]`. The optional
+/// `env_key` field names an environment variable that provides the API key, so
+/// secrets stay out of the config file:
+///
+/// ```toml
+/// [[model."gpt4o"]]
+/// base_url = "https://api.openai.com/v1"
+/// model = "gpt-4o"
+/// env_key = "OPENAI_API_KEY"
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LlmModel {
+    name: String,
+    config: LlmConfig,
+}
+
+impl LlmModel {
+    /// Creates a named model from an explicit name and resolved config.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LlmError::InvalidConfig`] when `name` is empty or contains
+    /// whitespace. Names are typed as `/model <name>`, so keeping them as a
+    /// single shell-like token avoids ambiguous command parsing.
+    pub fn new(
+        name: impl Into<String>,
+        config: LlmConfig,
+    ) -> Result<Self, LlmError> {
+        let name = name.into();
+        validate_model_section_name(&name)?;
+        Ok(Self { name, config })
+    }
+
+    /// The section name (the `<name>` in `[[model.<name>]]`).
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The resolved connection settings for this model.
+    #[must_use]
+    pub const fn config(&self) -> &LlmConfig {
+        &self.config
+    }
+
+    /// Loads every `[[model.<name>]]` section from the default `config.toml`.
+    ///
+    /// Returns an empty vector when the file, or its `[model]` table, is
+    /// absent. Models are returned in lexicographic section-name order. The
+    /// path is resolved by [`default_config_path`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LlmError::ConfigFile`] for read failures other than a missing
+    /// file, or [`LlmError::InvalidConfig`] for malformed values (including an
+    /// `env_key` whose environment variable is unset).
+    pub fn from_config() -> Result<Vec<Self>, LlmError> {
+        let Some(path) = default_config_path() else {
+            return Ok(Vec::new());
+        };
+        Self::from_config_path(path)
+    }
+
+    /// Loads `[[model.<name>]]` sections from an explicit TOML path.
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::from_config`].
+    pub fn from_config_path(path: impl AsRef<Path>) -> Result<Vec<Self>, LlmError> {
+        let raw = match std::fs::read_to_string(path.as_ref()) {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(LlmError::ConfigFile(error)),
+        };
+        Self::from_toml(&raw)
+    }
+
+    /// Parses `[[model.<name>]]` sections from a TOML document, resolving each
+    /// `env_key` against the process environment.
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::from_config`].
+    pub fn from_toml(input: &str) -> Result<Vec<Self>, LlmError> {
+        Self::from_toml_with_lookup(input, |key| std::env::var(key))
+    }
+
+    fn from_toml_with_lookup<F>(
+        input: &str,
+        mut lookup: F,
+    ) -> Result<Vec<Self>, LlmError>
+    where
+        F: FnMut(&str) -> Result<String, std::env::VarError>,
+    {
+        let document = toml::from_str::<FileConfig>(input)
+            .map_err(|_| LlmError::InvalidConfig("invalid config.toml".into()))?;
+        let Some(sections) = document.model else {
+            return Ok(Vec::new());
+        };
+        let mut models = Vec::with_capacity(sections.len());
+        for (name, entries) in sections {
+            models.push(resolve_model(name, entries, &mut lookup)?);
+        }
+        Ok(models)
+    }
+}
+
+fn resolve_model<F>(
+    name: String,
+    entries: Vec<FileModelEntry>,
+    lookup: &mut F,
+) -> Result<LlmModel, LlmError>
+where
+    F: FnMut(&str) -> Result<String, std::env::VarError>,
+{
+    validate_model_section_name(&name)?;
+    let mut entries = entries.into_iter();
+    let entry = entries
+        .next()
+        .ok_or_else(|| LlmError::InvalidConfig(format!("[[model.{name}]] has no entries")))?;
+    if entries.next().is_some() {
+        return Err(LlmError::InvalidConfig(format!(
+            "[[model.{name}]] is defined more than once"
+        )));
+    }
+    let base_url = entry
+        .base_url
+        .ok_or_else(|| LlmError::InvalidConfig(format!("[[model.{name}]] requires `base_url`")))?;
+    let model = entry
+        .model
+        .ok_or_else(|| LlmError::InvalidConfig(format!("[[model.{name}]] requires `model`")))?;
+    let api_key = match (entry.api_key, entry.env_key) {
+        (Some(_), Some(_)) => {
+            return Err(LlmError::InvalidConfig(format!(
+                "[[model.{name}]] sets both `api_key` and `env_key`; use one"
+            )));
+        },
+        (Some(api_key), None) => api_key,
+        (None, Some(env_key)) => resolve_env_key(&name, &env_key, lookup)?,
+        (None, None) => String::new(),
+    };
+    let api_mode = entry
+        .api_mode
+        .as_deref()
+        .map(ApiMode::parse)
+        .transpose()?
+        .unwrap_or_default();
+    let config = LlmConfig::new_with_mode(base_url, api_key, model, api_mode)?;
+    LlmModel::new(name, config)
+}
+
+fn validate_model_section_name(name: &str) -> Result<(), LlmError> {
+    if name.trim().is_empty() {
+        return Err(LlmError::InvalidConfig(
+            "model name must not be empty".into(),
+        ));
+    }
+    if name.chars().any(char::is_whitespace) {
+        return Err(LlmError::InvalidConfig(format!(
+            "model name `{name}` must not contain whitespace"
+        )));
+    }
+    Ok(())
+}
+
+fn resolve_env_key<F>(
+    name: &str,
+    env_key: &str,
+    lookup: &mut F,
+) -> Result<String, LlmError>
+where
+    F: FnMut(&str) -> Result<String, std::env::VarError>,
+{
+    validate_env_key(name, env_key)?;
+    match lookup(env_key) {
+        Ok(value) => Ok(value),
+        Err(std::env::VarError::NotPresent) => Err(LlmError::InvalidConfig(format!(
+            "[[model.{name}]] env_key `{env_key}` is not set"
+        ))),
+        Err(std::env::VarError::NotUnicode(_)) => Err(LlmError::InvalidConfig(format!(
+            "[[model.{name}]] env_key `{env_key}` must be valid UTF-8"
+        ))),
+    }
+}
+
+fn validate_env_key(
+    name: &str,
+    env_key: &str,
+) -> Result<(), LlmError> {
+    if env_key.is_empty() || env_key.chars().any(|ch| ch == '=' || ch == '\0') {
+        return Err(LlmError::InvalidConfig(format!(
+            "[[model.{name}]] env_key must be a valid environment variable name"
+        )));
+    }
+    Ok(())
+}
+
 #[derive(Deserialize)]
 struct FileConfig {
     llm: Option<FileLlmConfig>,
+    model: Option<BTreeMap<String, Vec<FileModelEntry>>>,
 }
 
 #[derive(Deserialize)]
@@ -334,6 +535,16 @@ struct FileConfig {
 struct FileLlmConfig {
     base_url: Option<String>,
     api_key: Option<String>,
+    model: Option<String>,
+    api_mode: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileModelEntry {
+    base_url: Option<String>,
+    api_key: Option<String>,
+    env_key: Option<String>,
     model: Option<String>,
     api_mode: Option<String>,
 }
@@ -550,6 +761,95 @@ mod tests {
         assert_eq!(config.api_key(), "super-secret");
         assert_eq!(config.model(), "gpt-5");
         assert_eq!(config.api_mode(), ApiMode::Responses);
+    }
+
+    #[test]
+    fn parses_named_models_from_toml_and_env_key() {
+        let models = LlmModel::from_toml_with_lookup(
+            r#"
+            [[model."gemma4"]]
+            base_url = "http://localhost:11434"
+            model = "gemma4:latest"
+
+            [[model."gpt4o"]]
+            base_url = "https://api.openai.com/v1"
+            env_key = "OPENAI_API_KEY"
+            model = "gpt-4o"
+            api_mode = "responses"
+            "#,
+            |key| match key {
+                "OPENAI_API_KEY" => Ok("env-secret".into()),
+                _ => Err(std::env::VarError::NotPresent),
+            },
+        )
+        .expect("models");
+        assert_eq!(models.len(), 2);
+        assert_eq!(
+            models.iter().map(LlmModel::name).collect::<Vec<_>>(),
+            vec!["gemma4", "gpt4o"]
+        );
+
+        let gemma = models
+            .iter()
+            .find(|model| model.name() == "gemma4")
+            .expect("gemma4 model");
+        assert_eq!(gemma.config().base_url(), "http://localhost:11434/v1");
+        assert_eq!(gemma.config().api_key(), "");
+        assert_eq!(gemma.config().model(), "gemma4:latest");
+        assert_eq!(gemma.config().api_mode(), ApiMode::ChatCompletions);
+
+        let gpt = models
+            .iter()
+            .find(|model| model.name() == "gpt4o")
+            .expect("gpt4o model");
+        assert_eq!(gpt.config().base_url(), "https://api.openai.com/v1");
+        assert_eq!(gpt.config().api_key(), "env-secret");
+        assert_eq!(gpt.config().model(), "gpt-4o");
+        assert_eq!(gpt.config().api_mode(), ApiMode::Responses);
+    }
+
+    #[test]
+    fn creates_named_model_from_config() {
+        let config = LlmConfig::new("http://localhost:4000", "", "m").expect("config");
+        let model = LlmModel::new("local", config.clone()).expect("model");
+        assert_eq!(model.name(), "local");
+        assert_eq!(model.config(), &config);
+        assert!(matches!(
+            LlmModel::new("bad name", config),
+            Err(LlmError::InvalidConfig(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_named_models() {
+        assert!(matches!(
+            LlmModel::from_toml_with_lookup(
+                "[[model.gemma4]]\nbase_url = \"http://localhost\"\nmodel = \"m\"\napi_key = \"k\"\nenv_key = \"K\"\n",
+                |_| Err(std::env::VarError::NotPresent),
+            ),
+            Err(LlmError::InvalidConfig(_))
+        ));
+        assert!(matches!(
+            LlmModel::from_toml_with_lookup(
+                "[[model.gemma4]]\nbase_url = \"http://localhost\"\nmodel = \"m\"\n[[model.gemma4]]\nbase_url = \"http://localhost\"\nmodel = \"m2\"\n",
+                |_| Err(std::env::VarError::NotPresent),
+            ),
+            Err(LlmError::InvalidConfig(_))
+        ));
+        assert!(matches!(
+            LlmModel::from_toml_with_lookup(
+                "[[model.gemma4]]\nbase_url = \"http://localhost\"\nmodel = \"m\"\nenv_key = \"MISSING\"\n",
+                |_| Err(std::env::VarError::NotPresent),
+            ),
+            Err(LlmError::InvalidConfig(_))
+        ));
+        assert!(matches!(
+            LlmModel::from_toml_with_lookup(
+                "[[model.gemma4]]\nbase_url = \"http://localhost\"\nmodel = \"m\"\nenv_key = \"BAD=KEY\"\n",
+                |_| Ok("must-not-read".into()),
+            ),
+            Err(LlmError::InvalidConfig(_))
+        ));
     }
 
     #[test]

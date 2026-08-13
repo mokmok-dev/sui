@@ -6,10 +6,15 @@
 //!
 //! # Configuration
 //!
-//! The binary loads `[llm]` from `$SUI_CONFIG`,
-//! `$XDG_CONFIG_HOME/sui/config.toml`, or `~/.config/sui/config.toml`. The
-//! same values can be supplied through `SUI_LLM_BASE_URL`, optional
-//! `SUI_LLM_API_KEY`, `SUI_LLM_MODEL`, and optional `SUI_LLM_API_MODE`.
+//! The binary loads switchable `[[model."name"]]` entries from `$SUI_CONFIG`,
+//! `$XDG_CONFIG_HOME/sui/config.toml`, or `~/.config/sui/config.toml`. Each
+//! entry accepts `base_url`, `model`, optional `api_key`, optional `env_key`
+//! (environment variable holding the API key), and optional `api_mode`.
+//!
+//! When no named models are configured, the binary falls back to a legacy
+//! `[llm]` section at the same config path. The same values can also be supplied
+//! through `SUI_LLM_BASE_URL`, optional `SUI_LLM_API_KEY`, `SUI_LLM_MODEL`, and
+//! optional `SUI_LLM_API_MODE`.
 //!
 //! `base_url` is trusted operator config (see [`LlmConfig`]). Do not pass
 //! untrusted URLs.
@@ -39,6 +44,6 @@ mod error;
 mod message;
 
 pub use client::{ChatChunk, ChatResponse, ChatStream, LlmClient};
-pub use config::{ApiMode, LlmConfig, default_config_path};
+pub use config::{ApiMode, LlmConfig, LlmModel, default_config_path};
 pub use error::{ApiError, LlmError};
 pub use message::{ChatMessage, Role, ToolCall, ToolSpec};
