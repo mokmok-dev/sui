@@ -21,7 +21,7 @@ mod error;
 use std::path::Path;
 
 use serde_json::{Value, json};
-use sui_llm::{ChatMessage, LlmClient, ToolCall, ToolSpec};
+use sui_llm::{ChatMessage, LlmClient, LlmError, ToolCall, ToolSpec};
 use sui_tools::ToolRegistry;
 
 pub use error::AgentError;
@@ -31,6 +31,8 @@ pub const DEFAULT_MAX_TURNS: usize = 32;
 
 /// Soft cap on a single tool result string fed back to the model.
 pub const MAX_TOOL_RESULT_CHARS: usize = 32_768;
+
+const EMPTY_RESPONSE_MAX_ATTEMPTS: usize = 3;
 
 /// Short standing orders. Tool *how* lives in JSON schemas, not here.
 #[must_use]
@@ -71,7 +73,8 @@ pub enum AgentEvent {
 /// Options for [`run_turn`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TurnOptions {
-    /// Maximum model samples (each tool round counts as one).
+    /// Maximum successful agent samples (each tool round counts as one).
+    /// Empty-response retry attempts are bounded separately.
     pub max_turns: usize,
 }
 
@@ -116,8 +119,9 @@ pub fn specs_from_registry(registry: &ToolRegistry) -> Vec<ToolSpec> {
 /// # Errors
 ///
 /// Returns [`AgentError::Llm`] on transport/API failures,
-/// [`AgentError::TurnLimit`] when the model never stops calling tools, or
-/// [`AgentError::Invalid`] when `max_turns` is zero.
+/// [`AgentError::EmptyResponse`] when bounded retries keep returning empty
+/// completions, [`AgentError::TurnLimit`] when the model never stops calling
+/// tools, or [`AgentError::Invalid`] when `max_turns` is zero.
 pub async fn run_turn<F>(
     client: &LlmClient,
     registry: &ToolRegistry,
@@ -152,7 +156,7 @@ where
     let specs = specs_from_registry(registry);
 
     for _ in 0..options.max_turns {
-        let response = client.chat_with_tools(messages, &specs).await?;
+        let response = sample_agent_completion(client, messages, &specs).await?;
         if response.tool_calls.is_empty() {
             messages.push(ChatMessage::assistant(response.content.clone()));
             return Ok(response.content);
@@ -176,6 +180,26 @@ where
         }
     }
     Err(AgentError::TurnLimit(options.max_turns))
+}
+
+async fn sample_agent_completion(
+    client: &LlmClient,
+    messages: &[ChatMessage],
+    specs: &[ToolSpec],
+) -> Result<sui_llm::ChatResponse, AgentError> {
+    let mut empty_responses = 0;
+    loop {
+        match client.chat_with_tools(messages, specs).await {
+            Ok(response) => return Ok(response),
+            Err(LlmError::EmptyResponse) => {
+                empty_responses += 1;
+                if empty_responses == EMPTY_RESPONSE_MAX_ATTEMPTS {
+                    return Err(AgentError::EmptyResponse(EMPTY_RESPONSE_MAX_ATTEMPTS));
+                }
+            },
+            Err(error) => return Err(AgentError::from(error)),
+        }
+    }
 }
 
 async fn execute_tool(
@@ -230,7 +254,7 @@ pub async fn run_turn_quiet(
 mod tests {
     use super::*;
     use serde_json::json;
-    use sui_llm::LlmConfig;
+    use sui_llm::{LlmConfig, Role};
     use sui_tools::{Tool, ToolFuture, ToolsError};
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
@@ -287,6 +311,30 @@ mod tests {
         let mut registry = ToolRegistry::new();
         registry.register(EchoTool);
         registry
+    }
+
+    fn empty_completion() -> serde_json::Value {
+        json!({
+            "id": "empty",
+            "object": "chat.completion",
+            "created": 1,
+            "model": "proxy-model",
+            "choices": []
+        })
+    }
+
+    fn text_completion(text: &str) -> serde_json::Value {
+        json!({
+            "id": "text",
+            "object": "chat.completion",
+            "created": 1,
+            "model": "proxy-model",
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": text },
+                "finish_reason": "stop"
+            }]
+        })
     }
 
     #[test]
@@ -590,6 +638,259 @@ mod tests {
         .await
         .expect_err("limit");
         assert!(matches!(err, AgentError::TurnLimit(1)));
+    }
+
+    #[tokio::test]
+    async fn run_turn_retries_transient_empty_then_succeeds_on_last_attempt() {
+        let server = MockServer::start().await;
+        assert_eq!(EMPTY_RESPONSE_MAX_ATTEMPTS, 3);
+        let empty_attempts = u64::try_from(EMPTY_RESPONSE_MAX_ATTEMPTS - 1).expect("fits");
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_partial_json(json!({
+                "messages": [{ "role": "user", "content": "hi" }],
+                "tools": [{ "function": { "name": "echo" } }]
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(empty_completion()))
+            .up_to_n_times(empty_attempts)
+            .expect(empty_attempts)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_partial_json(json!({
+                "messages": [{ "role": "user", "content": "hi" }],
+                "tools": [{ "function": { "name": "echo" } }]
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(text_completion("recovered")))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server, "proxy-model");
+        let mut messages = Vec::new();
+        let text = run_turn_quiet(
+            &client,
+            &echo_registry(),
+            &mut messages,
+            "hi",
+            TurnOptions::default(),
+        )
+        .await
+        .expect("turn");
+        assert_eq!(text, "recovered");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1].content, "recovered");
+    }
+
+    #[tokio::test]
+    async fn run_turn_retries_empty_between_tool_rounds_and_preserves_context() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_partial_json(json!({
+                "messages": [{ "role": "user", "content": "go" }]
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "c1",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "proxy-model",
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": null,
+                        "tool_calls": [{
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "echo",
+                                "arguments": "{\"text\":\"hi\"}"
+                            }
+                        }]
+                    },
+                    "finish_reason": "tool_calls"
+                }]
+            })))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_partial_json(json!({
+                "messages": [
+                    { "role": "user", "content": "go" },
+                    {
+                        "role": "assistant",
+                        "tool_calls": [{
+                            "id": "call_1",
+                            "function": { "name": "echo", "arguments": "{\"text\":\"hi\"}" }
+                        }]
+                    },
+                    {
+                        "role": "tool",
+                        "tool_call_id": "call_1",
+                        "content": "{\"text\":\"hi\"}"
+                    }
+                ]
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(empty_completion()))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_partial_json(json!({
+                "messages": [
+                    { "role": "user", "content": "go" },
+                    {
+                        "role": "assistant",
+                        "tool_calls": [{
+                            "id": "call_1",
+                            "function": { "name": "echo", "arguments": "{\"text\":\"hi\"}" }
+                        }]
+                    },
+                    {
+                        "role": "tool",
+                        "tool_call_id": "call_1",
+                        "content": "{\"text\":\"hi\"}"
+                    }
+                ]
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(text_completion("done")))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server, "proxy-model");
+        let mut messages = Vec::new();
+        let text = run_turn_quiet(
+            &client,
+            &echo_registry(),
+            &mut messages,
+            "go",
+            TurnOptions::default(),
+        )
+        .await
+        .expect("turn");
+        assert_eq!(text, "done");
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0].content, "go");
+        assert_eq!(messages[1].tool_calls[0].name, "echo");
+        assert_eq!(messages[2].role, Role::Tool);
+        assert_eq!(messages[2].tool_call_id.as_deref(), Some("call_1"));
+        assert!(messages[2].content.contains("hi"));
+        assert_eq!(messages[3].content, "done");
+    }
+
+    #[tokio::test]
+    async fn run_turn_surfaces_empty_response_after_exhaustion() {
+        let server = MockServer::start().await;
+        let attempts = u64::try_from(EMPTY_RESPONSE_MAX_ATTEMPTS).expect("fits");
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_partial_json(json!({
+                "messages": [{ "role": "user", "content": "hi" }],
+                "tools": [{ "function": { "name": "echo" } }]
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(empty_completion()))
+            .up_to_n_times(attempts)
+            .expect(attempts)
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server, "proxy-model");
+        let mut messages = Vec::new();
+        let err = run_turn_quiet(
+            &client,
+            &echo_registry(),
+            &mut messages,
+            "hi",
+            TurnOptions::default(),
+        )
+        .await
+        .expect_err("empty");
+        assert!(
+            matches!(err, AgentError::EmptyResponse(n) if n == EMPTY_RESPONSE_MAX_ATTEMPTS),
+            "{err:?}"
+        );
+        assert_eq!(messages.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn run_turn_does_not_retry_api_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(json!({
+                "error": {
+                    "message": "invalid key",
+                    "type": "auth_error",
+                    "param": null,
+                    "code": null
+                }
+            })))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server, "proxy-model");
+        let mut messages = Vec::new();
+        let err = run_turn_quiet(
+            &client,
+            &echo_registry(),
+            &mut messages,
+            "hi",
+            TurnOptions::default(),
+        )
+        .await
+        .expect_err("api error");
+        assert!(matches!(err, AgentError::Llm(LlmError::Api(_))), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn run_turn_stops_retrying_when_api_error_follows_empty() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(empty_completion()))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(json!({
+                "error": {
+                    "message": "invalid key",
+                    "type": "auth_error",
+                    "param": null,
+                    "code": null
+                }
+            })))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server, "proxy-model");
+        let mut messages = Vec::new();
+        let err = run_turn_quiet(
+            &client,
+            &echo_registry(),
+            &mut messages,
+            "hi",
+            TurnOptions::default(),
+        )
+        .await
+        .expect_err("api error after empty");
+        assert!(matches!(err, AgentError::Llm(LlmError::Api(_))), "{err:?}");
     }
 
     #[tokio::test]
