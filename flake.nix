@@ -52,7 +52,6 @@
         {
           self',
           config,
-          lib,
           system,
           ...
         }:
@@ -71,32 +70,26 @@
           };
           cargoArtifacts = craneLib.buildDepsOnly commonArgs;
 
-          crates = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.members;
-
-          individualCrateArgs =
-            name:
-            commonArgs
-            // {
-              pname = name;
-              cargoExtraArgs = "-p ${name}";
-              inherit cargoArtifacts;
-            };
-
-          # Packages only need to produce the binary; the workspace-wide `test`
-          # check below is the single owner of test execution. Running `cargo
-          # test -p <crate>` in every package's checkPhase would rebuild the
-          # shared dependency graph once per crate (cargo fingerprints do not
-          # survive the differing sandbox source paths), which is what made the
-          # old per-crate check derivations so slow.
-          mkPkg =
-            name:
-            craneLib.buildPackage (
-              individualCrateArgs name
-              // lib.optionalAttrs (name == "sui") { inherit version; }
-              // {
-                doCheck = false;
-              }
-            );
+          # Build the whole workspace in a single derivation (no `-p <crate>`)
+          # so the final `cargo build --locked` resolves exactly the same
+          # feature sets as the `buildDepsOnly` artifact. Building per-crate
+          # (`cargo build -p sui`) resolves a *subset* of the workspace
+          # features — e.g. `sui-workflow` pulls `rhai`, which enables
+          # `once_cell`'s `portable-atomic` feature — so cargo recompiles
+          # those crates on every build: the shared dependency artifact never
+          # matches the final build and the cache stops working.
+          #
+          # The output is only the `sui` binary (every other member is
+          # lib-only); do not reintroduce `-p`, `--features`, or asymmetric
+          # `cargoExtraArgs` here, or the feature-resolution mismatch returns.
+          packageArgs = commonArgs // {
+            pname = "sui";
+            inherit version;
+            # The workspace-wide `test` check below is the single owner of
+            # test execution; running tests here as well would only recompile
+            # and re-run them.
+            doCheck = false;
+          };
         in
         {
           checks = {
@@ -109,7 +102,8 @@
             );
           };
 
-          packages = builtins.listToAttrs (map (name: lib.nameValuePair name (mkPkg name)) crates) // {
+          packages = {
+            sui = craneLib.buildPackage (packageArgs // { inherit cargoArtifacts; });
             default = self'.packages.sui;
           };
 
