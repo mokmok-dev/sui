@@ -41,7 +41,12 @@ pub fn system_prompt(cwd: &Path) -> String {
         "You are sui, a coding agent working in {}. \
          Use tools to inspect and change the workspace. \
          Prefer code_search over listing files. \
-         Prefer the edit tool for file changes. \
+         Prefer the edit tool for file changes. The edit tool requires one Git \
+         unified diff with ---/+++ file headers and @@ hunk headers. Do not use \
+         SEARCH/REPLACE blocks or `*** Begin Patch` wrappers. For new files use \
+         --- /dev/null and +++ b/path; for deletions use --- a/path and +++ \
+         /dev/null. Hunk line counts are recalculated by the agent, but the diff \
+         must contain valid +/-/context lines. \
          For shell commands, call bash with a single-line `command` (action defaults to run). \
          Do not ask the user to run commands you can run yourself. \
          Talk to the user in assistant text, not via echo.",
@@ -309,6 +314,15 @@ mod tests {
         let mut registry = ToolRegistry::new();
         registry.register(EchoTool);
         registry
+    }
+
+    #[test]
+    fn system_prompt_describes_unified_diff_edit_contract() {
+        let prompt = system_prompt(Path::new("/tmp/worktree"));
+        assert!(prompt.contains("unified diff"));
+        assert!(prompt.contains("SEARCH/REPLACE"));
+        assert!(prompt.contains("/dev/null"));
+        assert!(prompt.contains("*** Begin Patch"));
     }
 
     fn empty_completion() -> serde_json::Value {
