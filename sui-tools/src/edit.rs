@@ -367,7 +367,7 @@ fn write_ahead_patch(response: &str) -> Result<PathBuf, ToolsError> {
     Ok(path)
 }
 
-/// Flags shared by `git apply --check` and `git apply`.
+/// Shared `git apply` flags (used by both `--check` and the real apply).
 ///
 /// Adopted for LLM-generated diffs:
 /// - `--ignore-whitespace`: locate hunks despite indent / tab-vs-space drift
@@ -379,21 +379,22 @@ fn write_ahead_patch(response: &str) -> Result<PathBuf, ToolsError> {
 /// - `--recount`: hunk counts are already rewritten by [`normalize_hunk_headers`]
 /// - `-C1`: does not absorb wrong context; further reduction (`-C0`) applies at
 ///   the wrong site
-fn git_apply_args<'a>(
+const GIT_APPLY_FLAGS: &[&str] = &[
+    "--whitespace=nowarn",
+    "--ignore-whitespace",
+    "--unidiff-zero",
+];
+
+fn git_apply_args(
     check: bool,
-    patch: &'a str,
-) -> Vec<&'a str> {
-    let mut args = Vec::with_capacity(6);
-    args.push("apply");
+    patch: &str,
+) -> Vec<&str> {
+    let mut args = vec!["apply"];
     if check {
         args.push("--check");
     }
-    args.extend([
-        "--whitespace=nowarn",
-        "--ignore-whitespace",
-        "--unidiff-zero",
-        patch,
-    ]);
+    args.extend_from_slice(GIT_APPLY_FLAGS);
+    args.push(patch);
     args
 }
 
@@ -523,13 +524,7 @@ mod tests {
     async fn applies_create_and_delete_through_git() -> Result<(), ToolsError> {
         let dir = TempDir(temp_dir("edit-git"));
         fs::create_dir_all(&dir.0).map_err(|source| ToolsError::io(&dir.0, source))?;
-        let init = Command::new("git")
-            .arg("-C")
-            .arg(&dir.0)
-            .args(["init", "-q"])
-            .status()
-            .map_err(|source| ToolsError::io("git", source))?;
-        assert!(init.success());
+        init_git_repo(&dir.0)?;
 
         let mut registry = ToolRegistry::new();
         registry.register(EditTool);
