@@ -9,8 +9,8 @@ use std::{
     fmt::Write as _,
     io::Write,
     path::{Path, PathBuf},
-    process::Command,
     sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
 };
 
 use gitpatch::Patch;
@@ -195,13 +195,34 @@ fn validate_hunk_counts(response: &str) -> Result<(), ToolsError> {
     Ok(())
 }
 
-fn git_output(command: &mut Command) -> Result<std::process::Output, ToolsError> {
-    command
-        .output()
-        .map_err(|source| ToolsError::io("git", source))
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-fn repository_root(file: &Path) -> Result<PathBuf, ToolsError> {
+async fn run_git(
+    cwd: &Path,
+    args: &[&str],
+) -> Result<crate::CommandOutput, ToolsError> {
+    let mut command = String::from("git");
+    for arg in args {
+        command.push(' ');
+        command.push_str(&shell_quote(arg));
+    }
+    crate::run_line(&command, Some(cwd), Duration::from_secs(30)).await
+}
+
+fn git_error(
+    operation: &str,
+    output: &crate::CommandOutput,
+) -> ToolsError {
+    ToolsError::Edit(format!(
+        "{operation} failed (exit {:?}): {}",
+        output.code,
+        output.stderr.trim()
+    ))
+}
+
+async fn repository_root(file: &Path) -> Result<PathBuf, ToolsError> {
     let absolute = absolute_target_path(file)?;
     let mut probe = absolute
         .parent()
@@ -212,21 +233,11 @@ fn repository_root(file: &Path) -> Result<PathBuf, ToolsError> {
             .ok_or_else(|| ToolsError::Edit("target has no existing parent directory".into()))?;
     }
     let probe = std::fs::canonicalize(probe).map_err(|source| ToolsError::io(probe, source))?;
-    let output = git_output(
-        Command::new("git")
-            .arg("-C")
-            .arg(probe)
-            .args(["rev-parse", "--show-toplevel"]),
-    )?;
-    if !output.status.success() {
-        return Err(ToolsError::Edit(format!(
-            "target is not inside a Git worktree: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
+    let output = run_git(&probe, &["rev-parse", "--show-toplevel"]).await?;
+    if output.code != Some(0) {
+        return Err(git_error("git rev-parse", &output));
     }
-    let root = String::from_utf8(output.stdout)
-        .map_err(|error| ToolsError::Edit(format!("git returned invalid path: {error}")))?;
-    let root = PathBuf::from(root.trim());
+    let root = PathBuf::from(output.stdout.trim());
     std::fs::canonicalize(&root).map_err(|source| ToolsError::io(&root, source))
 }
 
@@ -356,35 +367,22 @@ fn write_ahead_patch(response: &str) -> Result<PathBuf, ToolsError> {
     Ok(path)
 }
 
-fn apply_patch(
+async fn apply_patch(
     root: &Path,
     patch: &Path,
 ) -> Result<(), ToolsError> {
-    let check = git_output(
-        Command::new("git")
-            .arg("-C")
-            .arg(root)
-            .args(["apply", "--check", "--whitespace=nowarn"])
-            .arg(patch),
-    )?;
-    if !check.status.success() {
-        return Err(ToolsError::Edit(format!(
-            "git apply --check rejected patch: {}",
-            String::from_utf8_lossy(&check.stderr).trim()
-        )));
+    let patch = patch.to_string_lossy();
+    let check = run_git(
+        root,
+        &["apply", "--check", "--whitespace=nowarn", patch.as_ref()],
+    )
+    .await?;
+    if check.code != Some(0) {
+        return Err(git_error("git apply --check", &check));
     }
-    let applied = git_output(
-        Command::new("git")
-            .arg("-C")
-            .arg(root)
-            .args(["apply", "--whitespace=nowarn"])
-            .arg(patch),
-    )?;
-    if !applied.status.success() {
-        return Err(ToolsError::Edit(format!(
-            "git apply failed after check: {}",
-            String::from_utf8_lossy(&applied.stderr).trim()
-        )));
+    let applied = run_git(root, &["apply", "--whitespace=nowarn", patch.as_ref()]).await?;
+    if applied.code != Some(0) {
+        return Err(git_error("git apply", &applied));
     }
     Ok(())
 }
@@ -434,10 +432,10 @@ impl Tool for EditTool {
             let response = normalize_unified_diff(&args.response)?;
             validate_with_parser(&response)?;
             validate_hunk_counts(&response)?;
-            let root = repository_root(&args.file)?;
+            let root = repository_root(&args.file).await?;
             check_target(&root, &args.file, &response)?;
             let patch = write_ahead_patch(&response)?;
-            let result = apply_patch(&root, &patch);
+            let result = apply_patch(&root, &patch).await;
             let _ = std::fs::remove_file(&patch);
             result?;
             Ok(json!({ "file": args.file, "changed": true, "applied": true }))
@@ -459,6 +457,7 @@ mod tests {
     use crate::corpus::{TempDir, temp_dir};
     use serde_json::json;
     use std::fs;
+    use std::process::Command;
 
     const PATCH: &str = "diff --git a/sample.rs b/sample.rs\n--- a/sample.rs\n+++ b/sample.rs\n@@ -1,2 +1,2 @@\n-fn old() {}\n+fn new() {}\n fn main() {}\n";
 
