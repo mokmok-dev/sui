@@ -6,6 +6,7 @@
 //! file rewrite is performed here.
 
 use std::{
+    fmt::Write as _,
     io::Write,
     path::{Path, PathBuf},
     process::Command,
@@ -24,14 +25,16 @@ static PATCH_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 ///
 /// # Errors
 ///
-/// Returns [`ToolsError::Edit`] when the diff is empty, malformed, or has
-/// hunk line counts that do not match its header.
+/// Returns [`ToolsError::Edit`] when the diff is empty or malformed. Hunk
+/// counts are recalculated from the hunk body; counts supplied by the caller
+/// are not trusted.
 pub fn validate_unified_diff(response: &str) -> Result<(), ToolsError> {
     if response.trim().is_empty() {
         return Err(ToolsError::Edit("patch is empty".into()));
     }
-    parse_unified_diff(response)?;
-    validate_hunk_counts(response)
+    let normalized = normalize_unified_diff(response)?;
+    parse_unified_diff(&normalized)?;
+    validate_hunk_counts(&normalized)
 }
 
 fn parse_unified_diff(response: &str) -> Result<Patch<'_>, ToolsError> {
@@ -39,14 +42,95 @@ fn parse_unified_diff(response: &str) -> Result<Patch<'_>, ToolsError> {
         .map_err(|error| ToolsError::Edit(format!("invalid unified diff: {error}")))
 }
 
-fn parse_hunk_range(value: &str) -> Result<usize, ToolsError> {
+fn parse_hunk_range(value: &str) -> Result<(usize, usize), ToolsError> {
     let value = value
         .strip_prefix(['-', '+'])
         .ok_or_else(|| ToolsError::Edit(format!("invalid hunk range `{value}`")))?;
-    let (_, count) = value.split_once(',').map_or((value, "1"), |parts| parts);
-    count
+    let (start, count) = value.split_once(',').map_or((value, "1"), |parts| parts);
+    let start = start
         .parse()
-        .map_err(|_| ToolsError::Edit(format!("invalid hunk count `{count}`")))
+        .map_err(|_| ToolsError::Edit(format!("invalid hunk start `{start}`")))?;
+    let count = count
+        .parse()
+        .map_err(|_| ToolsError::Edit(format!("invalid hunk count `{count}`")))?;
+    Ok((start, count))
+}
+
+fn hunk_line_counts(lines: &[&str]) -> Result<(usize, usize), ToolsError> {
+    let mut old = 0;
+    let mut new = 0;
+    for line in lines {
+        match line.as_bytes().first().copied() {
+            Some(b' ') => {
+                old += 1;
+                new += 1;
+            },
+            Some(b'-') => old += 1,
+            Some(b'+') => new += 1,
+            Some(b'\\') => {},
+            _ => {
+                return Err(ToolsError::Edit(format!("invalid line in hunk `{line}`")));
+            },
+        }
+    }
+    Ok((old, new))
+}
+
+fn normalize_hunk_headers(response: &str) -> Result<String, ToolsError> {
+    let lines: Vec<&str> = response.split_inclusive('\n').collect();
+    let mut normalized = String::with_capacity(response.len());
+    let mut index = 0;
+    while index < lines.len() {
+        let line = lines[index];
+        if !line.starts_with("@@ ") {
+            normalized.push_str(line);
+            index += 1;
+            continue;
+        }
+        let header = line.trim_end_matches(['\r', '\n']);
+        let (body, suffix) = header
+            .strip_prefix("@@ ")
+            .and_then(|body| body.split_once(" @@"))
+            .ok_or_else(|| ToolsError::Edit(format!("invalid hunk header `{header}`")))?;
+        let mut ranges = body.split_whitespace();
+        let (old_start, _) = parse_hunk_range(
+            ranges
+                .next()
+                .ok_or_else(|| ToolsError::Edit("hunk is missing old range".into()))?,
+        )?;
+        let (new_start, _) = parse_hunk_range(
+            ranges
+                .next()
+                .ok_or_else(|| ToolsError::Edit("hunk is missing new range".into()))?,
+        )?;
+        if ranges.next().is_some() {
+            return Err(ToolsError::Edit(format!("invalid hunk header `{header}`")));
+        }
+        let content_start = index + 1;
+        let mut content_end = content_start;
+        while content_end < lines.len()
+            && !lines[content_end].starts_with("@@ ")
+            && !lines[content_end].starts_with("diff --git ")
+        {
+            content_end += 1;
+        }
+        let (old_count, new_count) = hunk_line_counts(&lines[content_start..content_end])?;
+        let ending = line.strip_prefix(header).unwrap_or("");
+        let _ = write!(
+            normalized,
+            "@@ -{old_start},{old_count} +{new_start},{new_count} @@{suffix}{ending}"
+        );
+        index = content_start;
+    }
+    Ok(normalized)
+}
+
+fn normalize_unified_diff(response: &str) -> Result<String, ToolsError> {
+    let mut normalized = normalize_hunk_headers(response)?;
+    if !normalized.ends_with('\n') {
+        normalized.push('\n');
+    }
+    Ok(normalized)
 }
 
 fn validate_hunk_counts(response: &str) -> Result<(), ToolsError> {
@@ -61,12 +145,12 @@ fn validate_hunk_counts(response: &str) -> Result<(), ToolsError> {
             .and_then(|body| body.split_once(" @@").map(|(body, _)| body))
             .ok_or_else(|| ToolsError::Edit(format!("invalid hunk header `{line}`")))?;
         let mut ranges = body.split_whitespace();
-        let old_count = parse_hunk_range(
+        let (_, old_count) = parse_hunk_range(
             ranges
                 .next()
                 .ok_or_else(|| ToolsError::Edit("hunk is missing old range".into()))?,
         )?;
-        let new_count = parse_hunk_range(
+        let (_, new_count) = parse_hunk_range(
             ranges
                 .next()
                 .ok_or_else(|| ToolsError::Edit("hunk is missing new range".into()))?,
@@ -303,7 +387,7 @@ impl Tool for EditTool {
 
     #[allow(clippy::unnecessary_literal_bound)]
     fn description(&self) -> &str {
-        "Apply one Git unified diff to the requested file. The patch must contain valid ---/+++ headers and hunk counts, and its path must match `file`. For a new file use --- /dev/null and +++ b/path; for deletion use --- a/path and +++ /dev/null. Renames and multi-file patches are rejected. The patch is written ahead, checked, and applied by git."
+        "Apply one Git unified diff to the requested file. Hunk counts are recalculated from the hunk body, and the path must match `file`. For a new file use --- /dev/null and +++ b/path; for deletion use --- a/path and +++ /dev/null. Renames and multi-file patches are rejected. The patch is written ahead, checked, and applied by git."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -311,7 +395,7 @@ impl Tool for EditTool {
             "type": "object",
             "properties": {
                 "file": { "type": "string", "description": "Requested target path; must match the patch header" },
-                "response": { "type": "string", "description": "One Git unified diff. New files: --- /dev/null and +++ b/path. Deletions: --- a/path and +++ /dev/null." }
+                "response": { "type": "string", "description": "One Git unified diff; hunk line counts are recalculated by the agent. New files: --- /dev/null and +++ b/path. Deletions: --- a/path and +++ /dev/null." }
             },
             "required": ["file", "response"],
             "additionalProperties": false
@@ -325,10 +409,12 @@ impl Tool for EditTool {
         Box::pin(async move {
             let args: EditArgs = serde_json::from_value(args)
                 .map_err(|error| ToolsError::InvalidArgs(error.to_string()))?;
-            validate_unified_diff(&args.response)?;
+            let response = normalize_unified_diff(&args.response)?;
+            parse_unified_diff(&response)?;
+            validate_hunk_counts(&response)?;
             let root = repository_root(&args.file)?;
-            check_target(&root, &args.file, &args.response)?;
-            let patch = write_ahead_patch(&args.response)?;
+            check_target(&root, &args.file, &response)?;
+            let patch = write_ahead_patch(&response)?;
             let result = apply_patch(&root, &patch);
             let _ = std::fs::remove_file(&patch);
             result?;
@@ -360,10 +446,15 @@ mod tests {
     }
 
     #[test]
-    fn rejects_invalid_hunk_counts() {
-        let error = validate_unified_diff("--- a/x\n+++ b/x\n@@ -1,2 +1,2 @@\n-old\n+new\n")
-            .expect_err("incomplete hunk");
-        assert!(error.to_string().contains("hunk header counts"));
+    fn recalculates_invalid_hunk_counts() -> Result<(), ToolsError> {
+        let normalized = normalize_unified_diff("--- a/x\n+++ b/x\n@@ -1,2 +1,2 @@\n-old\n+new\n")?;
+        assert!(normalized.contains("@@ -1,1 +1,1 @@"));
+        validate_unified_diff(&normalized)
+    }
+
+    #[test]
+    fn accepts_empty_added_line_without_trailing_newline() -> Result<(), ToolsError> {
+        validate_unified_diff("--- a/x\n+++ b/x\n@@ -1 +1,2 @@\n-old\n+new\n+")
     }
 
     #[test]
