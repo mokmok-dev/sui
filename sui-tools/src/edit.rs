@@ -33,13 +33,17 @@ pub fn validate_unified_diff(response: &str) -> Result<(), ToolsError> {
         return Err(ToolsError::Edit("patch is empty".into()));
     }
     let normalized = normalize_unified_diff(response)?;
-    parse_unified_diff(&normalized)?;
+    validate_with_parser(&normalized)?;
     validate_hunk_counts(&normalized)
 }
 
-fn parse_unified_diff(response: &str) -> Result<Patch<'_>, ToolsError> {
-    Patch::from_single(response)
-        .map_err(|error| ToolsError::Edit(format!("invalid unified diff: {error}")))
+fn validate_with_parser(response: &str) -> Result<(), ToolsError> {
+    if Patch::from_single(response).is_err() {
+        // Keep accepting valid Git dialects that gitpatch rejects; the local
+        // structural validator and `git apply --check` are authoritative.
+        validate_hunk_counts(response)?;
+    }
+    Ok(())
 }
 
 fn parse_hunk_range(value: &str) -> Result<(usize, usize), ToolsError> {
@@ -289,15 +293,33 @@ fn header_path(path: &str) -> Option<&str> {
     }
 }
 
+fn patch_paths(response: &str) -> Result<(&str, &str), ToolsError> {
+    let mut old = None;
+    let mut new = None;
+    for line in response.lines() {
+        if let Some(path) = line.strip_prefix("--- ") {
+            old = Some(path.split_once('\t').map_or(path, |(path, _)| path));
+        } else if let Some(path) = line.strip_prefix("+++ ") {
+            new = Some(path.split_once('\t').map_or(path, |(path, _)| path));
+        }
+    }
+    match (old, new) {
+        (Some(old), Some(new)) => Ok((old, new)),
+        _ => Err(ToolsError::Edit(
+            "patch must contain --- and +++ file headers".into(),
+        )),
+    }
+}
+
 fn check_target(
     root: &Path,
     file: &Path,
     response: &str,
 ) -> Result<(), ToolsError> {
     let target = relative_target(root, file)?;
-    let patch = parse_unified_diff(response)?;
-    let old = header_path(&patch.old.path);
-    let new = header_path(&patch.new.path);
+    let (old, new) = patch_paths(response)?;
+    let old = header_path(old.trim_matches('"'));
+    let new = header_path(new.trim_matches('"'));
     if old != Some(target.to_string_lossy().as_ref())
         && new != Some(target.to_string_lossy().as_ref())
     {
@@ -410,7 +432,7 @@ impl Tool for EditTool {
             let args: EditArgs = serde_json::from_value(args)
                 .map_err(|error| ToolsError::InvalidArgs(error.to_string()))?;
             let response = normalize_unified_diff(&args.response)?;
-            parse_unified_diff(&response)?;
+            validate_with_parser(&response)?;
             validate_hunk_counts(&response)?;
             let root = repository_root(&args.file)?;
             check_target(&root, &args.file, &response)?;
