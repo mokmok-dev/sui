@@ -10,7 +10,7 @@
 //! crate deliberately does **not** copy:
 //!
 //! - Grok Build's ACP / leader / Computer Hub (multi-client platform)
-//! - `OpenCode`'s 9-layer fuzzy edit matching (sui `edit` is byte-exact)
+//! - `OpenCode`'s 9-layer fuzzy edit matching (sui `edit` requires a Git diff)
 //! - pi's three-layer `ToolDefinition` wrapping (sui already has [`sui_tools::Tool`])
 //!
 //! Dedicated `grep` / `read` / `write` tools are deferred: `code_search`,

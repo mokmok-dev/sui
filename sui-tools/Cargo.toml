@@ -1,11 +1,11 @@
 [package]
-description = "Agent tool-calling foundation: lexical code search, one-shot and session bash, SEARCH/REPLACE edits, and a thin tool registry."
+description = "Agent tool-calling foundation: lexical code search, one-shot and session bash, Git unified-diff edits, and a thin tool registry."
 edition.workspace = true
 name = "sui-tools"
 version.workspace = true
 
 [dependencies]
-regex = { workspace = true }
+gitpatch = "0.7.1"
 serde = { workspace = true }
 serde_json = { workspace = true }
 tantivy = { workspace = true }
