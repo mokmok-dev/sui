@@ -367,20 +367,46 @@ fn write_ahead_patch(response: &str) -> Result<PathBuf, ToolsError> {
     Ok(path)
 }
 
+/// Flags shared by `git apply --check` and `git apply`.
+///
+/// Adopted for LLM-generated diffs:
+/// - `--ignore-whitespace`: locate hunks despite indent / tab-vs-space drift
+/// - `--unidiff-zero`: accept hunks with no context lines (`git diff -U0`)
+///
+/// Rejected:
+/// - `--3way`: needs `index` blob lines, implies `--index`, can write conflict
+///   markers into the worktree
+/// - `--recount`: hunk counts are already rewritten by [`normalize_hunk_headers`]
+/// - `-C1`: does not absorb wrong context; further reduction (`-C0`) applies at
+///   the wrong site
+fn git_apply_args<'a>(
+    check: bool,
+    patch: &'a str,
+) -> Vec<&'a str> {
+    let mut args = Vec::with_capacity(6);
+    args.push("apply");
+    if check {
+        args.push("--check");
+    }
+    args.extend([
+        "--whitespace=nowarn",
+        "--ignore-whitespace",
+        "--unidiff-zero",
+        patch,
+    ]);
+    args
+}
+
 async fn apply_patch(
     root: &Path,
     patch: &Path,
 ) -> Result<(), ToolsError> {
     let patch = patch.to_string_lossy();
-    let check = run_git(
-        root,
-        &["apply", "--check", "--whitespace=nowarn", patch.as_ref()],
-    )
-    .await?;
+    let check = run_git(root, &git_apply_args(true, patch.as_ref())).await?;
     if check.code != Some(0) {
         return Err(git_error("git apply --check", &check));
     }
-    let applied = run_git(root, &["apply", "--whitespace=nowarn", patch.as_ref()]).await?;
+    let applied = run_git(root, &git_apply_args(false, patch.as_ref())).await?;
     if applied.code != Some(0) {
         return Err(git_error("git apply", &applied));
     }
@@ -457,6 +483,7 @@ mod tests {
     use crate::corpus::{TempDir, temp_dir};
     use serde_json::json;
     use std::fs;
+    use std::path::{Path, PathBuf};
     use std::process::Command;
 
     const PATCH: &str = "diff --git a/sample.rs b/sample.rs\n--- a/sample.rs\n+++ b/sample.rs\n@@ -1,2 +1,2 @@\n-fn old() {}\n+fn new() {}\n fn main() {}\n";
@@ -531,6 +558,109 @@ mod tests {
             )
             .await?;
         assert!(!file.exists());
+        Ok(())
+    }
+
+    fn init_git_repo(dir: &Path) -> Result<(), ToolsError> {
+        let init = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["init", "-q"])
+            .status()
+            .map_err(|source| ToolsError::io("git", source))?;
+        assert!(init.success());
+        Ok(())
+    }
+
+    async fn edit_file(
+        dir: &Path,
+        relative: &str,
+        contents: &str,
+        response: &str,
+    ) -> Result<PathBuf, ToolsError> {
+        fs::write(dir.join(relative), contents)
+            .map_err(|source| ToolsError::io(dir.join(relative), source))?;
+        let mut registry = ToolRegistry::new();
+        registry.register(EditTool);
+        let file = dir.join(relative);
+        registry
+            .call(
+                "edit",
+                json!({
+                    "file": file,
+                    "response": response
+                }),
+            )
+            .await?;
+        Ok(file)
+    }
+
+    #[tokio::test]
+    async fn applies_despite_indent_drift() -> Result<(), ToolsError> {
+        let dir = TempDir(temp_dir("edit-indent"));
+        fs::create_dir_all(&dir.0).map_err(|source| ToolsError::io(&dir.0, source))?;
+        init_git_repo(&dir.0)?;
+        let file = edit_file(
+            &dir.0,
+            "sample.rs",
+            "fn main() {\n    let x = 1;\n}\n",
+            "diff --git a/sample.rs b/sample.rs\n--- a/sample.rs\n+++ b/sample.rs\n@@ -1,3 +1,3 @@\n fn main() {\n-  let x = 1;\n+    let x = 2;\n }\n",
+        )
+        .await?;
+        assert_eq!(
+            fs::read_to_string(&file).map_err(|source| ToolsError::io(&file, source))?,
+            "fn main() {\n    let x = 2;\n}\n"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn applies_zero_context_hunk() -> Result<(), ToolsError> {
+        let dir = TempDir(temp_dir("edit-u0"));
+        fs::create_dir_all(&dir.0).map_err(|source| ToolsError::io(&dir.0, source))?;
+        init_git_repo(&dir.0)?;
+        let file = edit_file(
+            &dir.0,
+            "sample.rs",
+            "fn old() {}\nfn main() {}\n",
+            "diff --git a/sample.rs b/sample.rs\n--- a/sample.rs\n+++ b/sample.rs\n@@ -1,1 +1,1 @@\n-fn old() {}\n+fn new() {}\n",
+        )
+        .await?;
+        assert_eq!(
+            fs::read_to_string(&file).map_err(|source| ToolsError::io(&file, source))?,
+            "fn new() {}\nfn main() {}\n"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_wrong_non_whitespace_context() -> Result<(), ToolsError> {
+        let dir = TempDir(temp_dir("edit-wrong-ctx"));
+        fs::create_dir_all(&dir.0).map_err(|source| ToolsError::io(&dir.0, source))?;
+        init_git_repo(&dir.0)?;
+        fs::write(dir.0.join("sample.rs"), "fn main() {\n    let x = 1;\n}\n")
+            .map_err(|source| ToolsError::io(dir.0.join("sample.rs"), source))?;
+        let mut registry = ToolRegistry::new();
+        registry.register(EditTool);
+        let error = registry
+            .call(
+                "edit",
+                json!({
+                    "file": dir.0.join("sample.rs"),
+                    "response": "diff --git a/sample.rs b/sample.rs\n--- a/sample.rs\n+++ b/sample.rs\n@@ -1,3 +1,3 @@\n fn missing() {\n-    let x = 1;\n+    let x = 2;\n }\n"
+                }),
+            )
+            .await
+            .expect_err("wrong context must not apply");
+        assert!(
+            error.to_string().contains("git apply"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.0.join("sample.rs"))
+                .map_err(|source| ToolsError::io(dir.0.join("sample.rs"), source))?,
+            "fn main() {\n    let x = 1;\n}\n"
+        );
         Ok(())
     }
 }
