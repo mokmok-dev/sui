@@ -364,9 +364,11 @@ impl BashSession {
 
     /// Waits up to `duration` for the process to exit.
     ///
-    /// On timeout the process group is signalled, readers are aborted, and
-    /// [`WaitOutcome::timed_out`] is set. Callers should [`Self::drain`] afterward
-    /// to collect any partial output (this method does not clear buffers).
+    /// On timeout the process group is signalled and readers are allowed to
+    /// finish draining the pipes (they see EOF once the group is dead), so any
+    /// partial output survives. [`WaitOutcome::timed_out`] is set. Callers
+    /// should [`Self::drain`] afterward to collect that output (this method does
+    /// not clear buffers).
     ///
     /// # Errors
     ///
@@ -413,7 +415,8 @@ impl BashSession {
         Ok(())
     }
 
-    /// Kills the bash session (process group on Unix) and stops reader tasks.
+    /// Kills the bash session (process group on Unix) and lets reader tasks
+    /// drain any remaining pipe output before stopping.
     ///
     /// # Errors
     ///
@@ -425,7 +428,11 @@ impl BashSession {
     async fn kill_session(&mut self) -> Result<(), ToolsError> {
         // Group first so orphan grandchildren release inherited pipes.
         self.kill_process_group()?;
-        self.abort_readers().await;
+        // Let readers consume anything still in the pipes: after the group is
+        // dead the write ends close, readers see EOF, and partial output that
+        // was written but not yet read survives. Aborting the readers here
+        // would discard it (a timeout `wait` would then report empty stdout).
+        self.finish_readers().await;
         match self.child.kill().await {
             Ok(()) => Ok(()),
             // Already reaped after group kill / wait.
@@ -475,13 +482,6 @@ impl BashSession {
                     let _ = handle.await;
                 }
             }
-        }
-    }
-
-    async fn abort_readers(&mut self) {
-        for handle in self.reader_handles.drain(..) {
-            handle.abort();
-            let _ = handle.await;
         }
     }
 }
