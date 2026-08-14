@@ -6,8 +6,8 @@
 //! - [`corpus`]: shared tree-walk / skip policy for lexical indexers
 //! - [`bash`]: async non-blocking bash session primitives (pipes, not a PTY)
 //!   plus [`run_line`] for one-shot commands
-//! - [`edit`]: `SEARCH` / `REPLACE` block parser + [`tool::EditTool`] applying
-//!   LLM edit blocks to files
+//! - [`edit`]: Git unified diff validation and safe application via
+//!   [`tool::EditTool`]
 //! - [`tool`]: thin [`Tool`] trait + registry with builtin `code_search` /
 //!   `bash` / `edit`
 //!
@@ -36,7 +36,7 @@ pub use bm25::{
     SearchHit, tokenize,
 };
 pub use corpus::list_workspace_files;
-pub use edit::{EditTool, SearchReplaceBlock, apply_blocks, parse_search_replace_blocks};
+pub use edit::{EditTool, validate_unified_diff};
 pub use error::ToolsError;
 pub use tantivy_index::TantivyIndex;
 pub use tool::{

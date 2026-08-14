@@ -100,7 +100,13 @@
         in
         {
           checks = {
-            test = craneLib.cargoTest (commonArgs // { inherit cargoArtifacts; });
+            test = craneLib.cargoTest (
+              commonArgs
+              // {
+                inherit cargoArtifacts;
+                nativeBuildInputs = [ pkgs.gitMinimal ];
+              }
+            );
           };
 
           packages = builtins.listToAttrs (map (name: lib.nameValuePair name (mkPkg name)) crates) // {

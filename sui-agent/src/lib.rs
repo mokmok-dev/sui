@@ -10,7 +10,7 @@
 //! crate deliberately does **not** copy:
 //!
 //! - Grok Build's ACP / leader / Computer Hub (multi-client platform)
-//! - `OpenCode`'s 9-layer fuzzy edit matching (sui `edit` is byte-exact)
+//! - `OpenCode`'s 9-layer fuzzy edit matching (sui `edit` requires a Git diff)
 //! - pi's three-layer `ToolDefinition` wrapping (sui already has [`sui_tools::Tool`])
 //!
 //! Dedicated `grep` / `read` / `write` tools are deferred: `code_search`,
@@ -41,7 +41,12 @@ pub fn system_prompt(cwd: &Path) -> String {
         "You are sui, a coding agent working in {}. \
          Use tools to inspect and change the workspace. \
          Prefer code_search over listing files. \
-         Prefer the edit tool for file changes. \
+         Prefer the edit tool for file changes. Provide one Git unified diff with \
+         ---/+++ file headers and @@ hunk headers. Example existing-file edit: \
+         `diff --git a/path b/path\\n--- a/path\\n+++ b/path\\n@@ -1,1 +1,1 @@\\n-old\\n+new`. \
+         For a new file use `--- /dev/null` and `+++ b/path`; for deletion use \
+         `--- a/path` and `+++ /dev/null`. Hunk line counts are recalculated by \
+         the agent, but the diff must contain valid +/-/context lines. \
          For shell commands, call bash with a single-line `command` (action defaults to run). \
          Do not ask the user to run commands you can run yourself. \
          Talk to the user in assistant text, not via echo.",
@@ -309,6 +314,14 @@ mod tests {
         let mut registry = ToolRegistry::new();
         registry.register(EchoTool);
         registry
+    }
+
+    #[test]
+    fn system_prompt_describes_unified_diff_edit_contract() {
+        let prompt = system_prompt(Path::new("/tmp/worktree"));
+        assert!(prompt.contains("unified diff"));
+        assert!(prompt.contains("diff --git a/path b/path"));
+        assert!(prompt.contains("/dev/null"));
     }
 
     fn empty_completion() -> serde_json::Value {
